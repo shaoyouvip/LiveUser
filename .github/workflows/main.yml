@@ -39,8 +39,6 @@ jobs:
   worker:
     name: Worker checks
     runs-on: ubuntu-latest
-    env:
-      VISITOR_HMAC_SECRET: ci-only-liveuser-secret-0123456789abcdef
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

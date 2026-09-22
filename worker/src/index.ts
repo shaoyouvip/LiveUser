@@ -2,18 +2,17 @@ const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const MAX_REQUEST_BYTES = 1024;
 const SITE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$/;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RETENTION_DAYS = 2;
 const SCHEMA_STATEMENTS = [
-  `CREATE TABLE IF NOT EXISTS daily_visitors (
+  `CREATE TABLE IF NOT EXISTS daily_pageviews (
     site_id TEXT NOT NULL,
     visit_date TEXT NOT NULL,
-    visitor_key TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (site_id, visit_date, visitor_key)
+    pv INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (site_id, visit_date)
   ) WITHOUT ROWID`,
-  `CREATE INDEX IF NOT EXISTS idx_daily_visitors_date
-    ON daily_visitors (visit_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_daily_pageviews_date
+    ON daily_pageviews (visit_date)`,
 ];
 const initializedDatabases = new WeakSet<D1Database>();
 const databaseInitializationPromises = new WeakMap<D1Database, Promise<void>>();
@@ -27,11 +26,10 @@ const dateFormatter = new Intl.DateTimeFormat("en-CA", {
 
 interface VisitRequestBody {
   siteId?: unknown;
-  visitorId?: unknown;
 }
 
-interface CountRow {
-  today: number;
+interface PageViewRow {
+  pv: number;
 }
 
 export default {
@@ -43,11 +41,21 @@ export default {
         return handlePreflight(request);
       }
 
-      if (request.method === "POST" && url.pathname === "/v1/visit") {
-        return await handleVisit(request, env);
+      if (url.pathname !== "/v1/visit") {
+        return jsonResponse({ error: "Not found" }, 404);
       }
 
-      return jsonResponse({ error: "Not found" }, 404);
+      if (request.method === "POST") {
+        return await handlePageView(request, env);
+      }
+
+      if (request.method === "GET") {
+        return await handlePageViewCount(request, env);
+      }
+
+      const origin = request.headers.get("Origin");
+      const response = jsonResponse({ error: "Method not allowed" }, 405);
+      return origin && siteIdFromOrigin(origin) ? withCors(response, origin) : response;
     } catch (error) {
       console.error(JSON.stringify({
         event: "request_failed",
@@ -67,7 +75,7 @@ export default {
     try {
       await ensureDatabaseSchema(env.DB);
       const result = await env.DB.prepare(
-        "DELETE FROM daily_visitors WHERE visit_date < ?1",
+        "DELETE FROM daily_pageviews WHERE visit_date < ?1",
       ).bind(cutoffDate).run();
 
       console.log(JSON.stringify({
@@ -85,7 +93,7 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function handleVisit(request: Request, env: Env): Promise<Response> {
+async function handlePageView(request: Request, env: Env): Promise<Response> {
   const origin = request.headers.get("Origin");
   if (!origin || !siteIdFromOrigin(origin)) {
     return jsonResponse({ error: "Origin required" }, 400);
@@ -121,43 +129,41 @@ async function handleVisit(request: Request, env: Env): Promise<Response> {
     return withCors(jsonResponse({ error: "Invalid siteId" }, 400), origin);
   }
 
-  if (typeof body.visitorId !== "string" || !UUID_PATTERN.test(body.visitorId)) {
-    return withCors(jsonResponse({ error: "Invalid visitorId" }, 400), origin);
-  }
-
-  if (env.VISITOR_HMAC_SECRET.length < 32) {
-    throw new Error("VISITOR_HMAC_SECRET must contain at least 32 characters");
-  }
-
   const visitDate = shanghaiDate(new Date());
-  const visitorKey = await visitorDigest(
-    env.VISITOR_HMAC_SECRET,
-    siteId,
-    visitDate,
-    body.visitorId,
-  );
   const timestamp = Math.floor(Date.now() / 1000);
 
   await ensureDatabaseSchema(env.DB);
   await env.DB.prepare(
-    `INSERT OR IGNORE INTO daily_visitors
-      (site_id, visit_date, visitor_key, created_at)
-     VALUES (?1, ?2, ?3, ?4)`,
-  ).bind(siteId, visitDate, visitorKey, timestamp).run();
+    `INSERT INTO daily_pageviews
+      (site_id, visit_date, pv, updated_at)
+     VALUES (?1, ?2, 1, ?3)
+     ON CONFLICT(site_id, visit_date) DO UPDATE SET
+       pv = pv + 1,
+       updated_at = excluded.updated_at`,
+  ).bind(siteId, visitDate, timestamp).run();
 
-  const row = await env.DB.prepare(
-    `SELECT COUNT(*) AS today
-       FROM daily_visitors
-      WHERE site_id = ?1 AND visit_date = ?2`,
-  ).bind(siteId, visitDate).first<CountRow>();
+  const pv = await readPageViews(env.DB, siteId, visitDate);
+  return pageViewResponse(siteId, pv, visitDate, timestamp, origin);
+}
 
-  return withCors(jsonResponse({
-    type: "visit",
-    siteId,
-    today: Number(row?.today ?? 0),
-    date: visitDate,
-    timestamp,
-  }), origin);
+async function handlePageViewCount(request: Request, env: Env): Promise<Response> {
+  const origin = request.headers.get("Origin");
+  if (!origin || !siteIdFromOrigin(origin)) {
+    return jsonResponse({ error: "Origin required" }, 400);
+  }
+
+  const url = new URL(request.url);
+  const siteId = resolveSiteId(url.searchParams.get("siteId"), origin);
+  if (!siteId || !SITE_ID_PATTERN.test(siteId)) {
+    return withCors(jsonResponse({ error: "Invalid siteId" }, 400), origin);
+  }
+
+  const visitDate = shanghaiDate(new Date());
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  await ensureDatabaseSchema(env.DB);
+  const pv = await readPageViews(env.DB, siteId, visitDate);
+  return pageViewResponse(siteId, pv, visitDate, timestamp, origin);
 }
 
 function isVisitRequestBody(value: unknown): value is VisitRequestBody {
@@ -181,6 +187,46 @@ function siteIdFromOrigin(origin: string): string | null {
   } catch {
     return null;
   }
+}
+
+async function readPageViews(db: D1Database, siteId: string, visitDate: string): Promise<number> {
+  const row = await db.prepare(
+    `SELECT pv
+       FROM daily_pageviews
+      WHERE site_id = ?1 AND visit_date = ?2`,
+  ).bind(siteId, visitDate).first<PageViewRow>();
+
+  return Number(row?.pv ?? 0);
+}
+
+function pageViewResponse(
+  siteId: string,
+  pv: number,
+  date: string,
+  timestamp: number,
+  origin: string,
+): Response {
+  return withCors(jsonResponse({
+    type: "visit",
+    siteId,
+    pv,
+    date,
+    timestamp,
+  }), origin);
+}
+
+function handlePreflight(request: Request): Response {
+  const origin = request.headers.get("Origin");
+  if (!origin || !siteIdFromOrigin(origin)) {
+    return jsonResponse({ error: "Origin required" }, 400);
+  }
+
+  const requestedMethod = request.headers.get("Access-Control-Request-Method");
+  if (requestedMethod !== "POST" && requestedMethod !== "GET") {
+    return withCors(jsonResponse({ error: "Method not allowed" }, 405), origin);
+  }
+
+  return withCors(new Response(null, { status: 204 }), origin);
 }
 
 async function readLimitedText(request: Request, limit: number): Promise<string | null> {
@@ -218,20 +264,6 @@ async function readLimitedText(request: Request, limit: number): Promise<string 
   } finally {
     reader.releaseLock();
   }
-}
-
-function handlePreflight(request: Request): Response {
-  const origin = request.headers.get("Origin");
-  if (!origin || !siteIdFromOrigin(origin)) {
-    return jsonResponse({ error: "Origin required" }, 400);
-  }
-
-  const requestedMethod = request.headers.get("Access-Control-Request-Method");
-  if (requestedMethod !== "POST") {
-    return withCors(jsonResponse({ error: "Method not allowed" }, 405), origin);
-  }
-
-  return withCors(new Response(null, { status: 204 }), origin);
 }
 
 export function shanghaiDate(date: Date): string {
@@ -272,28 +304,6 @@ async function initializeDatabaseSchema(db: D1Database): Promise<void> {
   await db.batch(SCHEMA_STATEMENTS.map((statement) => db.prepare(statement)));
 }
 
-async function visitorDigest(
-  secret: string,
-  siteId: string,
-  visitDate: string,
-  visitorId: string,
-): Promise<string> {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    encoder.encode(`${siteId}\0${visitDate}\0${visitorId.toLowerCase()}`),
-  );
-  return Array.from(new Uint8Array(signature), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -308,7 +318,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 function withCors(response: Response, origin: string): Response {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", origin);
-  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
   headers.set("Access-Control-Max-Age", "86400");
   headers.append("Vary", "Origin");

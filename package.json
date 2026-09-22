@@ -2,7 +2,7 @@
   "name": "liveuser",
   "version": "0.1.0",
   "private": true,
-  "description": "LiveUser online and daily visitor statistics services",
+  "description": "LiveUser online and daily page view statistics services",
   "scripts": {
     "worker:types": "wrangler types worker-configuration.d.ts",
     "worker:check": "npm run worker:types && tsc --noEmit",

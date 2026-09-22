@@ -1,6 +1,6 @@
 # LiveUser 架构
 
-更新时间：2026-09-22 18:49（Asia/Shanghai）
+更新时间：2026-09-23 01:00（Asia/Shanghai）
 
 ## 目标
 
@@ -9,7 +9,7 @@ LiveUser 是通用、独立部署的在线统计服务。它不绑定某个网�
 服务提供两个指标：
 
 - `online`：Go WebSocket 服务中某个 `siteId` 当前已加入的连接数。
-- `today`：Cloudflare Worker + D1 中某个 `siteId` 当天不同 HMAC 摘要数。
+- `pv`：Cloudflare Worker + D1 中某个 `siteId` 当天的页面访问量。每次页面加载或刷新增加 1，不做访客去重。
 
 ## 架构
 
@@ -17,11 +17,13 @@ LiveUser 是通用、独立部署的在线统计服务。它不绑定某个网�
 浏览器页面
   ├─ WebSocket ───────> Go 服务
   │                        └─ 内存中的在线连接数
-  └─ POST /v1/visit ──> Worker + D1
-                           └─ 当天去重摘要
+  ├─ POST /v1/visit ──> Worker + D1
+  │                        └─ 当天 PV 计数 + 1
+  └─ GET /v1/visit ───> Worker + D1
+                           └─ 读取当前 PV，不增加
 ```
 
-Go 服务不持久化在线人数，重启后 `online` 从零开始。Worker/D1 只保存去重后的摘要，不保存原始访客标识。
+Go 服务不持久化在线人数，重启后 `online` 从零开始。Worker/D1 只保存聚合 PV 计数，不保存原始访客标识。
 
 ## 统计分区
 
@@ -49,30 +51,38 @@ Go 服务不持久化在线人数，重启后 `online` 从零开始。Worker/D1 
 
 `count` 是 `online` 的兼容字段。Go 只统计已完成加入的连接，连接断开后立即减少，空站点记录同步删除。消息包含心跳、读写超时、1 KiB 大小限制和断线清理。
 
-## 今日访问接口
+## 今日 PV 接口
+
+每次页面加载或刷新发送一次：
 
 ```http
 POST /v1/visit
 Content-Type: application/json
 Origin: https://example.com
 
-{"visitorId":"<uuid>"}
+{"siteId":"example.com"}
 ```
 
 响应：
 
 ```json
-{"type":"visit","siteId":"example.com","today":56,"date":"2026-09-22","timestamp":1750000000}
+{"type":"visit","siteId":"example.com","pv":56,"date":"2026-09-23","timestamp":1750000000}
 ```
 
-Worker 请求体限制为 1 KiB，拒绝非法 JSON、非法 `siteId` 和非法 `visitorId`。日期按 `Asia/Shanghai` 切换。
+页面停留期间读取最新数值，不增加 PV：
+
+```http
+GET /v1/visit?siteId=example.com
+Origin: https://example.com
+```
+
+Worker 请求体限制为 1 KiB，拒绝非法 JSON 和非法 `siteId`。日期按 `Asia/Shanghai` 切换。`POST` 每次都执行计数递增，因此刷新页面也会继续叠加。前端使用 `keepalive` 发送 PV 请求，避免刷新或离开页面时中止尚未完成的计数。
 
 ## 隐私与保留
 
-- 浏览器生成随机 `visitorId`，优先使用 `crypto.randomUUID()`，只在 `localStorage` 中按 `siteId` 保存。
+- 浏览器仍会为 WebSocket 在线统计生成随机 `visitorId`，但 Worker 的 PV 请求不发送 `visitorId`。
 - Go 只在 WebSocket 连接内接收 `visitorId` 做格式校验，不记录或持久化原始 `visitorId`；不读取或保存 IP、User-Agent、Referer。
-- Worker 使用 `HMAC-SHA256(secret, siteId + "\0" + date + "\0" + visitorId.toLowerCase())`，D1 只存 64 个十六进制字符的 HMAC-SHA256 摘要。
-- D1 表字段为 `site_id`、`visit_date`、`visitor_key`、`created_at`。
+- D1 表 `daily_pageviews` 只存 `site_id`、`visit_date`、`pv`、`updated_at`。
 - 业务保留窗口固定为 2 天，Cron 每小时清理旧数据；Cloudflare D1 Time Travel 仍由平台控制。
 - 文档不承诺即时物理删除。
 
@@ -90,10 +100,9 @@ Worker 必需配置：
 
 | 配置 | 说明 |
 | --- | --- |
-| `VISITOR_HMAC_SECRET` | 至少 32 字符的 HMAC 密钥，在 Worker 的“设置 → 变量和密钥”中配置 |
 | `DB` | D1 binding，在 `wrangler.jsonc` 中配置 |
 
-Worker 接受任意合法网站 Origin，CORS 回显请求 Origin。
+Worker 接受任意合法网站 Origin，CORS 回显请求 Origin。PV 接口不需要环境变量或密钥。
 
 Worker 在访问 D1 前会自动执行幂等的表结构初始化；同一运行时实例只初始化一次，初始化失败不会缓存，后续请求会重试。公开的 Migration 文件保持幂等，仅供本地开发或手工排查。
 
@@ -105,8 +114,7 @@ Worker 在访问 D1 前会自动执行幂等的表结构初始化；同一运行
 - 反向代理必须支持 WebSocket Upgrade，并将 `/v1/visit` 路由到 Worker。
 - `serverUrl` 同时决定 WebSocket 与 `/v1/visit` 的地址；跨域接入时，目标基址必须同时具备这两条路由。
 - Worker 通过 Cloudflare Workers 构建从 Git 部署：构建命令留空，部署命令保持默认。
-- 部署只发布 Worker；首次访问 `/v1/visit` 时会自动创建缺失的 D1 表和索引，不需要手动执行 Migration。首次部署会自动创建并绑定 D1，不要求 Fork 用户本地执行 Wrangler。
-- `VISITOR_HMAC_SECRET` 在 Worker 的“设置 → 变量和密钥”中配置，必须使用运行时密钥，不要放到“构建变量和密钥”。
+- 部署只发布 Worker；首次访问 `/v1/visit` 时会自动创建缺失的 `daily_pageviews` 表和索引，不需要手动执行 Migration。
 - 不把生产域名、D1 `database_id`、密钥或服务器信息写入公开仓库。
 
 ## 验证
@@ -125,4 +133,4 @@ npm run worker:test
 npm run worker:deploy:check
 ```
 
-目标环境还需要实测 WebSocket 连接/断开、广播、重连、D1 去重、上海跨日、Cron 清理、反向代理 WSS 和容器启动。本地 mock 通过不代表线上验收完成。
+目标环境还需要实测 WebSocket 连接/断开、广播、重连、PV 连续递增、上海跨日、Cron 清理、反向代理 WSS 和容器启动。本地 mock 通过不代表线上验收完成。

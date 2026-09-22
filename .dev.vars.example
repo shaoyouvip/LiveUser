@@ -1,3 +1,0 @@
-# Local-only secret used by `wrangler dev` and `wrangler deploy --secrets-file`.
-# Replace this intentionally invalid placeholder with at least 32 random characters.
-VISITOR_HMAC_SECRET=replace-me

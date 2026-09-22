@@ -4,44 +4,45 @@ import { shanghaiDate } from "../src/index";
 
 beforeAll(async () => {
   await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS daily_visitors (
+    CREATE TABLE IF NOT EXISTS daily_pageviews (
       site_id TEXT NOT NULL,
       visit_date TEXT NOT NULL,
-      visitor_key TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      PRIMARY KEY (site_id, visit_date, visitor_key)
+      pv INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (site_id, visit_date)
     ) WITHOUT ROWID
   `).run();
   await env.DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_daily_visitors_date
-      ON daily_visitors (visit_date)
+    CREATE INDEX IF NOT EXISTS idx_daily_pageviews_date
+      ON daily_pageviews (visit_date)
   `).run();
 });
 
 beforeEach(async () => {
-  await env.DB.prepare("DELETE FROM daily_visitors").run();
+  await env.DB.prepare("DELETE FROM daily_pageviews").run();
 });
 
-describe("daily visit Worker", () => {
-  it("deduplicates the same visitor on the same site and day", async () => {
-    const visitorId = crypto.randomUUID();
-    const first = await postVisit("example-site", visitorId);
-    const second = await postVisit("example-site", visitorId);
+describe("daily page view Worker", () => {
+  it("counts every request without deduplication", async () => {
+    const first = await postPageView("example-site");
+    const second = await postPageView("example-site");
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    const firstBody = await first.json<{ today: number }>();
-    const secondBody = await second.json<{ today: number }>();
-    expect(firstBody.today).toBeGreaterThanOrEqual(1);
-    expect(secondBody.today).toBe(firstBody.today);
+    const firstBody = await first.json<{ pv: number }>();
+    const secondBody = await second.json<{ pv: number }>();
+    expect(firstBody.pv).toBe(1);
+    expect(secondBody.pv).toBe(2);
   });
 
-  it("counts different visitor identifiers", async () => {
-    const first = await postVisit("example-site", crypto.randomUUID());
-    const second = await postVisit("example-site", crypto.randomUUID());
-    const firstBody = await first.json<{ today: number }>();
-    const secondBody = await second.json<{ today: number }>();
-    expect(secondBody.today).toBe(firstBody.today + 1);
+  it("keeps page view counters separate for different sites", async () => {
+    const first = await postPageView("site-a");
+    const other = await postPageView("site-b");
+    const second = await postPageView("site-a");
+
+    expect((await first.json<{ pv: number }>()).pv).toBe(1);
+    expect((await other.json<{ pv: number }>()).pv).toBe(1);
+    expect((await second.json<{ pv: number }>()).pv).toBe(2);
   });
 
   it("accepts any valid website origin", async () => {
@@ -51,29 +52,43 @@ describe("daily visit Worker", () => {
         Origin: "https://another.example",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ visitorId: crypto.randomUUID() }),
+      body: JSON.stringify({}),
     });
     expect(response.status).toBe(200);
-    const body = await response.json<{ siteId: string }>();
+    const body = await response.json<{ siteId: string; pv: number }>();
     expect(body.siteId).toBe("another.example");
+    expect(body.pv).toBe(1);
   });
 
   it("derives the siteId from Origin when omitted", async () => {
-    const response = await postVisit(undefined, crypto.randomUUID());
+    const response = await postPageView(undefined);
     expect(response.status).toBe(200);
     const body = await response.json<{ siteId: string }>();
     expect(body.siteId).toBe("localhost");
   });
 
   it("accepts an explicit siteId as a partition override", async () => {
-    const response = await postVisit("blog.example.com", crypto.randomUUID());
+    const response = await postPageView("blog.example.com");
     expect(response.status).toBe(200);
     const body = await response.json<{ siteId: string }>();
     expect(body.siteId).toBe("blog.example.com");
   });
 
-  it("rejects malformed visitor identifiers", async () => {
-    const response = await postVisit("example-site", "not-a-uuid");
+  it("returns the current page view count without incrementing it", async () => {
+    await postPageView("example-site");
+    await postPageView("example-site");
+
+    const first = await getPageViews("example-site");
+    const second = await getPageViews("example-site");
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect((await first.json<{ pv: number }>()).pv).toBe(2);
+    expect((await second.json<{ pv: number }>()).pv).toBe(2);
+  });
+
+  it("rejects malformed site identifiers", async () => {
+    const response = await postPageView("not a site id");
     expect(response.status).toBe(400);
   });
 
@@ -90,17 +105,6 @@ describe("daily visit Worker", () => {
     expect(response.status).toBe(400);
   });
 
-  it("does not store the raw visitor identifier", async () => {
-    const visitorId = crypto.randomUUID();
-    await postVisit("example-site", visitorId);
-    const rows = await env.DB.prepare(
-      "SELECT visitor_key FROM daily_visitors WHERE site_id = ?1 ORDER BY created_at DESC LIMIT 10",
-    ).bind("example-site").all<{ visitor_key: string }>();
-
-    expect(rows.results.some((row) => row.visitor_key === visitorId)).toBe(false);
-    expect(rows.results.every((row) => /^[0-9a-f]{64}$/.test(row.visitor_key))).toBe(true);
-  });
-
   it("rejects request bodies larger than one KiB", async () => {
     const response = await SELF.fetch("https://worker.test/v1/visit", {
       method: "POST",
@@ -110,7 +114,6 @@ describe("daily visit Worker", () => {
       },
       body: JSON.stringify({
         siteId: "example-site",
-        visitorId: crypto.randomUUID(),
         padding: "x".repeat(2048),
       }),
     });
@@ -139,13 +142,25 @@ describe("daily visit Worker", () => {
   });
 });
 
-function postVisit(siteId: string | undefined, visitorId: string): Promise<Response> {
+function postPageView(siteId: string | undefined): Promise<Response> {
   return SELF.fetch("https://worker.test/v1/visit", {
     method: "POST",
     headers: {
       Origin: "http://localhost:8787",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(siteId ? { siteId, visitorId } : { visitorId }),
+    body: JSON.stringify(siteId ? { siteId } : {}),
+  });
+}
+
+function getPageViews(siteId: string | undefined): Promise<Response> {
+  const url = new URL("https://worker.test/v1/visit");
+  if (siteId) {
+    url.searchParams.set("siteId", siteId);
+  }
+  return SELF.fetch(url, {
+    headers: {
+      Origin: "http://localhost:8787",
+    },
   });
 }

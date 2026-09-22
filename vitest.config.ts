@@ -5,11 +5,6 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
-      miniflare: {
-        bindings: {
-          VISITOR_HMAC_SECRET: "test-only-liveuser-secret-0123456789abcdef",
-        },
-      },
     }),
   ],
 });

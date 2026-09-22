@@ -21,10 +21,5 @@
     "crons": [
       "17 * * * *"
     ]
-  },
-  "secrets": {
-    "required": [
-      "VISITOR_HMAC_SECRET"
-    ]
   }
 }

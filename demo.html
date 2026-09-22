@@ -46,7 +46,7 @@
 						<legend>实时统计</legend>
 						<div class="layui-field-box">
 							<blockquote class="layui-elem-quote">
-								<p>在线 / 今日：
+								<p>在线 / 访问：
 									<span id="liveuser">
 										<!-- 加载时显示旋转图标 -->
 										<i class="layui-icon layui-icon-loading-1 layui-anim layui-anim-rotate layui-anim-loop"
@@ -62,12 +62,12 @@
 						<legend>LiveUser 服务介绍</legend>
 						<div class="layui-field-box">
 							<blockquote class="layui-elem-quote">
-								LiveUser 使用 Go + WebSocket 统计当前在线连接数，并使用 Cloudflare Worker + D1 统计当天去重访客数。
+								LiveUser 使用 Go + WebSocket 统计当前在线连接数，并使用 Cloudflare Worker + D1 统计当天页面访问量（PV）。每次页面加载或刷新都会累计一次。
 							</blockquote>
 							<ul class="layui-ul">
 								<li><strong>实时在线：</strong> Go WebSocket 长连接按站点推送当前连接数</li>
-								<li><strong>每日去重：</strong> Cloudflare Worker + D1 仅保存当日 HMAC 摘要</li>
-								<li><strong>隐私优先：</strong> 不读取 IP、User-Agent、Referer，不保存原始 visitorId</li>
+								<li><strong>访问量统计：</strong> Cloudflare Worker + D1 每次页面访问累计 PV</li>
+								<li><strong>隐私优先：</strong> 不读取 IP、User-Agent、Referer，不保存访客身份</li>
 								<li><strong>多站点支持：</strong> 默认按当前页面域名隔离统计</li>
 								<li><strong>可独立部署：</strong> WebSocket 容器与 Cloudflare Worker 可分别部署</li>
 							</ul>

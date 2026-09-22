@@ -2,7 +2,7 @@
  * LiveUser browser client.
  *
  * Online count: Go WebSocket service from `serverUrl`.
- * Daily visitors: Cloudflare Worker + D1 endpoint at `/v1/visit`.
+ * Page views: Cloudflare Worker + D1 endpoint at `/v1/visit`.
  */
 (function() {
     'use strict';
@@ -99,10 +99,11 @@
             this.ws = null;
             this.isActive = !document.hidden;
             this.reconnectTimer = null;
-            this.visitRefreshTimer = null;
-            this.visitController = null;
+            this.pvWriteController = null;
+            this.pvReadController = null;
+            this.pvRefreshTimer = null;
             this.currentOnline = null;
-            this.currentToday = null;
+            this.currentPV = null;
             this.displayElement = null;
             this.siteId = String(CONFIG.siteId || '').trim().toLowerCase() || currentSiteID();
             this.visitorId = null;
@@ -121,9 +122,9 @@
             this.visitorId = loadVisitorID(this.siteId);
             this.initialized = true;
             this.log('LiveUser 初始化，站点: ' + this.siteId);
-            this.recordVisit();
+            this.recordPageView();
             this.connect();
-            this.visitRefreshTimer = window.setInterval(() => this.recordVisit(), 5 * 60 * 1000);
+            this.pvRefreshTimer = window.setInterval(() => this.refreshPageViews(), 5 * 60 * 1000);
         }
 
         checkDisplayElement() {
@@ -139,14 +140,15 @@
 
             window.addEventListener('online', () => {
                 this.log('网络恢复');
-                this.recordVisit();
+                this.refreshPageViews();
                 this.connect();
             });
 
             const close = () => {
                 this.isActive = false;
-                if (this.visitController) {
-                    this.visitController.abort();
+                // Let the PV request finish so an immediate refresh is still counted.
+                if (this.pvReadController) {
+                    this.pvReadController.abort();
                 }
                 if (this.ws) {
                     this.ws.close(1000, 'page closed');
@@ -161,7 +163,7 @@
             if (!this.isActive) {
                 return;
             }
-            this.recordVisit();
+            this.refreshPageViews();
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
                 this.connect();
             }
@@ -256,7 +258,7 @@
             }
         }
 
-        recordVisit() {
+        recordPageView() {
             if (!this.initialized || !this.isActive) {
                 return;
             }
@@ -264,19 +266,20 @@
             if (!url) {
                 return;
             }
-            if (this.visitController) {
-                this.visitController.abort();
+            if (this.pvWriteController) {
+                this.pvWriteController.abort();
             }
             const controller = new AbortController();
-            this.visitController = controller;
+            this.pvWriteController = controller;
 
             fetch(url, {
                 method: 'POST',
                 mode: 'cors',
                 credentials: 'omit',
                 cache: 'no-store',
+                keepalive: true,
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ siteId: this.siteId, visitorId: this.visitorId }),
+                body: JSON.stringify({ siteId: this.siteId }),
                 signal: controller.signal
             }).then(response => {
                 if (!response.ok) {
@@ -284,24 +287,74 @@
                 }
                 return response.json();
             }).then(data => {
-                if (this.visitController !== controller || !data || data.siteId !== this.siteId) {
+                if (this.pvWriteController !== controller) {
                     return;
                 }
-                const today = Number(data.today);
-                if (Number.isFinite(today) && today >= 0) {
-                    this.currentToday = today;
-                    this.render();
-                    this.emitUpdate('visit');
-                }
+                this.updatePageViews(data);
             }).catch(error => {
                 if (error.name !== 'AbortError') {
-                    this.log('今日访问统计失败: ' + error.message);
+                    this.log('访问统计失败: ' + error.message);
                 }
             }).finally(() => {
-                if (this.visitController === controller) {
-                    this.visitController = null;
+                if (this.pvWriteController === controller) {
+                    this.pvWriteController = null;
                 }
             });
+        }
+
+        refreshPageViews() {
+            if (!this.initialized || !this.isActive || this.pvWriteController) {
+                return;
+            }
+            const url = visitsURL();
+            if (!url) {
+                return;
+            }
+            const requestURL = new URL(url);
+            requestURL.searchParams.set('siteId', this.siteId);
+            if (this.pvReadController) {
+                this.pvReadController.abort();
+            }
+            const controller = new AbortController();
+            this.pvReadController = controller;
+
+            fetch(requestURL.toString(), {
+                method: 'GET',
+                mode: 'cors',
+                credentials: 'omit',
+                cache: 'no-store',
+                signal: controller.signal
+            }).then(response => {
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                return response.json();
+            }).then(data => {
+                if (this.pvReadController !== controller) {
+                    return;
+                }
+                this.updatePageViews(data);
+            }).catch(error => {
+                if (error.name !== 'AbortError') {
+                    this.log('访问统计失败: ' + error.message);
+                }
+            }).finally(() => {
+                if (this.pvReadController === controller) {
+                    this.pvReadController = null;
+                }
+            });
+        }
+
+        updatePageViews(data) {
+            if (!data || data.siteId !== this.siteId) {
+                return;
+            }
+            const pv = Number(data.pv);
+            if (Number.isFinite(pv) && pv >= 0) {
+                this.currentPV = pv;
+                this.render();
+                this.emitUpdate('pv');
+            }
         }
 
         render() {
@@ -315,8 +368,8 @@
             if (this.currentOnline !== null) {
                 parts.push('在线 ' + this.currentOnline);
             }
-            if (this.currentToday !== null) {
-                parts.push('今日 ' + this.currentToday);
+            if (this.currentPV !== null) {
+                parts.push('访问 ' + this.currentPV);
             }
             if (parts.length > 0) {
                 this.displayElement.textContent = parts.join(' · ');
@@ -330,7 +383,7 @@
                 detail: {
                     siteId: this.siteId,
                     online: this.currentOnline,
-                    today: this.currentToday,
+                    pv: this.currentPV,
                     count: this.currentOnline,
                     reason: reason
                 }
@@ -357,8 +410,8 @@
             return this.currentOnline === null ? 0 : this.currentOnline;
         }
 
-        getToday() {
-            return this.currentToday === null ? 0 : this.currentToday;
+        getPV() {
+            return this.currentPV === null ? 0 : this.currentPV;
         }
 
         getStatus() {
@@ -379,13 +432,17 @@
                 window.clearTimeout(this.reconnectTimer);
                 this.reconnectTimer = null;
             }
-            if (this.visitRefreshTimer) {
-                window.clearInterval(this.visitRefreshTimer);
-                this.visitRefreshTimer = null;
+            if (this.pvRefreshTimer) {
+                window.clearInterval(this.pvRefreshTimer);
+                this.pvRefreshTimer = null;
             }
-            if (this.visitController) {
-                this.visitController.abort();
-                this.visitController = null;
+            if (this.pvWriteController) {
+                this.pvWriteController.abort();
+                this.pvWriteController = null;
+            }
+            if (this.pvReadController) {
+                this.pvReadController.abort();
+                this.pvReadController = null;
             }
             if (this.ws) {
                 this.ws.close(1000, 'manual disconnect');
@@ -412,8 +469,8 @@
         window.getLiveUserCount = function() {
             return window.LiveUser ? window.LiveUser.getCount() : 0;
         };
-        window.getLiveUserToday = function() {
-            return window.LiveUser ? window.LiveUser.getToday() : 0;
+        window.getLiveUserPV = function() {
+            return window.LiveUser ? window.LiveUser.getPV() : 0;
         };
         window.getLiveUserStatus = function() {
             return window.LiveUser ? window.LiveUser.getStatus() : 'not-initialized';
