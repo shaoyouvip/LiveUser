@@ -9,8 +9,8 @@
     "worker:test": "vitest run",
     "worker:dev": "wrangler dev --local",
     "worker:deploy:check": "wrangler deploy --dry-run",
-    "worker:migrate:local": "wrangler d1 migrations apply liveuser-visits --local",
-    "worker:migrate:remote": "wrangler d1 migrations apply liveuser-visits --remote"
+    "worker:migrate:local": "wrangler d1 migrations apply liveuser --local",
+    "worker:migrate:remote": "wrangler d1 migrations apply liveuser --remote"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",

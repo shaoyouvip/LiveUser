@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "liveuser-visits",
+  "name": "liveuser",
   "main": "worker/src/index.ts",
   "compatibility_date": "2026-08-22",
   "compatibility_flags": [
@@ -9,7 +9,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "liveuser-visits",
+      "database_name": "liveuser",
       "migrations_dir": "worker/migrations"
     }
   ],

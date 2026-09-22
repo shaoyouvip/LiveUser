@@ -1,6 +1,6 @@
 # LiveUser
 
-更新时间：2026-09-22 16:36（Asia/Shanghai）
+更新时间：2026-09-22 17:46（Asia/Shanghai）
 
 轻量、通用的网站在线统计服务。
 
@@ -49,7 +49,7 @@ cp .dev.vars.example .dev.vars
 # 编辑 .dev.vars，填入至少 32 个字符的随机密钥
 # 首次 deploy 会创建或绑定 Worker、D1；如写回 database_id，只保留在本地
 npx wrangler deploy --secrets-file .dev.vars
-npx wrangler d1 migrations apply liveuser-visits --remote
+npx wrangler d1 migrations apply liveuser --remote
 ```
 
 推送 `main` 只运行 CI；发布 GHCR 镜像需要在 GitHub Actions 中手动执行 `workflow_dispatch`。
@@ -57,7 +57,7 @@ npx wrangler d1 migrations apply liveuser-visits --remote
 本地开发：
 
 ```bash
-npx wrangler d1 migrations apply liveuser-visits --local
+npx wrangler d1 migrations apply liveuser --local
 npx wrangler dev --local
 ```
 
