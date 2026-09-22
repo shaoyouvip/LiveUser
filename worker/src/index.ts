@@ -4,6 +4,19 @@ const MAX_REQUEST_BYTES = 1024;
 const SITE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RETENTION_DAYS = 2;
+const SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS daily_visitors (
+    site_id TEXT NOT NULL,
+    visit_date TEXT NOT NULL,
+    visitor_key TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (site_id, visit_date, visitor_key)
+  ) WITHOUT ROWID`,
+  `CREATE INDEX IF NOT EXISTS idx_daily_visitors_date
+    ON daily_visitors (visit_date)`,
+];
+const initializedDatabases = new WeakSet<D1Database>();
+const databaseInitializationPromises = new WeakMap<D1Database, Promise<void>>();
 
 const dateFormatter = new Intl.DateTimeFormat("en-CA", {
   timeZone: SHANGHAI_TIME_ZONE,
@@ -52,6 +65,7 @@ export default {
     const cutoffDate = addDays(shanghaiDate(new Date()), -(RETENTION_DAYS - 1));
 
     try {
+      await ensureDatabaseSchema(env.DB);
       const result = await env.DB.prepare(
         "DELETE FROM daily_visitors WHERE visit_date < ?1",
       ).bind(cutoffDate).run();
@@ -124,6 +138,7 @@ async function handleVisit(request: Request, env: Env): Promise<Response> {
   );
   const timestamp = Math.floor(Date.now() / 1000);
 
+  await ensureDatabaseSchema(env.DB);
   await env.DB.prepare(
     `INSERT OR IGNORE INTO daily_visitors
       (site_id, visit_date, visitor_key, created_at)
@@ -229,6 +244,32 @@ function addDays(isoDate: string, days: number): string {
   const [year, month, day] = isoDate.split("-").map(Number);
   const date = new Date(Date.UTC(year, month - 1, day + days));
   return date.toISOString().slice(0, 10);
+}
+
+async function ensureDatabaseSchema(db: D1Database): Promise<void> {
+  if (initializedDatabases.has(db)) {
+    return;
+  }
+
+  const pending = databaseInitializationPromises.get(db);
+  if (pending) {
+    await pending;
+    return;
+  }
+
+  const initialization = initializeDatabaseSchema(db);
+  databaseInitializationPromises.set(db, initialization);
+
+  try {
+    await initialization;
+    initializedDatabases.add(db);
+  } finally {
+    databaseInitializationPromises.delete(db);
+  }
+}
+
+async function initializeDatabaseSchema(db: D1Database): Promise<void> {
+  await db.batch(SCHEMA_STATEMENTS.map((statement) => db.prepare(statement)));
 }
 
 async function visitorDigest(

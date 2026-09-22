@@ -1,6 +1,6 @@
 # LiveUser
 
-更新时间：2026-09-22 18:26（Asia/Shanghai）
+更新时间：2026-09-22 18:49（Asia/Shanghai）
 
 轻量、通用的网站在线统计服务。
 
@@ -47,13 +47,13 @@ Compose 默认只把端口绑定到宿主机 `127.0.0.1:10086`，HTTPS/WSS 由�
 | 配置项 | 值 |
 | --- | --- |
 | 构建命令 | 留空 |
-| 部署命令 | `npm run worker:deploy` |
+| 部署命令 | 保持默认 |
 | 非生产分支部署命令 | 保持默认 `npx wrangler versions upload` |
 | 运行时密钥 | `VISITOR_HMAC_SECRET`，至少 32 个随机字符 |
 
-`worker:deploy` 会先部署 Worker，再自动应用 D1 migration。首次部署时 Cloudflare 会自动创建并绑定 D1；Fork 用户不需要本地安装 Wrangler、执行迁移或提交 `database_id`。
+首次访问 `/v1/visit` 时，Worker 会自动创建缺失的 D1 表和索引，Fork 用户不需要手动执行 Migration，也不需要提交 `database_id`。首次部署时 Cloudflare 会按 `wrangler.jsonc` 自动创建并绑定 D1；若构建令牌没有 D1 权限，需要为该构建选择或创建带 `D1 Edit` 权限的令牌。
 
-`VISITOR_HMAC_SECRET` 在 Worker 的**设置 → 变量和密钥**中配置，不要放到“构建变量和密钥”。若构建使用的 API 令牌没有 D1 权限，在 Cloudflare 控制台为该构建选择或创建带 `D1 Edit` 权限的令牌后重试。
+`VISITOR_HMAC_SECRET` 在 Worker 的**设置 → 变量和密钥**中配置，不要放到“构建变量和密钥”。
 
 推送 `main` 只运行 CI；发布 GHCR 镜像需要在 GitHub Actions 中手动执行 `workflow_dispatch`。
 
@@ -62,7 +62,6 @@ Compose 默认只把端口绑定到宿主机 `127.0.0.1:10086`，HTTPS/WSS 由�
 ```bash
 npm ci --legacy-peer-deps
 cp .dev.vars.example .dev.vars
-npm run worker:migrate:local
 npm run worker:dev
 ```
 

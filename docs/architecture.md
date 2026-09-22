@@ -1,6 +1,6 @@
 # LiveUser 架构
 
-更新时间：2026-09-22 18:26（Asia/Shanghai）
+更新时间：2026-09-22 18:49（Asia/Shanghai）
 
 ## 目标
 
@@ -95,6 +95,8 @@ Worker 必需配置：
 
 Worker 接受任意合法网站 Origin，CORS 回显请求 Origin。
 
+Worker 在访问 D1 前会自动执行幂等的表结构初始化；同一运行时实例只初始化一次，初始化失败不会缓存，后续请求会重试。公开的 Migration 文件保持幂等，仅供本地开发或手工排查。
+
 ## 部署
 
 - Go 使用 Docker 镜像运行，容器内默认监听 `0.0.0.0:10086`。
@@ -102,8 +104,8 @@ Worker 接受任意合法网站 Origin，CORS 回显请求 Origin。
 - 推送 `main` 只运行 CI；发布 GHCR 镜像需手动执行 `workflow_dispatch`。
 - 反向代理必须支持 WebSocket Upgrade，并将 `/v1/visit` 路由到 Worker。
 - `serverUrl` 同时决定 WebSocket 与 `/v1/visit` 的地址；跨域接入时，目标基址必须同时具备这两条路由。
-- Worker 通过 Cloudflare Workers 构建从 Git 部署：构建命令留空，部署命令使用 `npm run worker:deploy`。
-- `worker:deploy` 先执行 `wrangler deploy`，再执行 `wrangler d1 migrations apply liveuser --remote`。首次部署会自动创建并绑定 D1，不要求 Fork 用户本地执行 Wrangler。
+- Worker 通过 Cloudflare Workers 构建从 Git 部署：构建命令留空，部署命令保持默认。
+- 部署只发布 Worker；首次访问 `/v1/visit` 时会自动创建缺失的 D1 表和索引，不需要手动执行 Migration。首次部署会自动创建并绑定 D1，不要求 Fork 用户本地执行 Wrangler。
 - `VISITOR_HMAC_SECRET` 在 Worker 的“设置 → 变量和密钥”中配置，必须使用运行时密钥，不要放到“构建变量和密钥”。
 - 不把生产域名、D1 `database_id`、密钥或服务器信息写入公开仓库。
 
