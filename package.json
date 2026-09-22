@@ -2,15 +2,14 @@
   "name": "liveuser",
   "version": "0.1.0",
   "private": true,
-  "description": "LiveUser online and daily page view statistics services",
+  "description": "LiveUser online and daily view statistics services",
   "scripts": {
     "worker:types": "wrangler types worker-configuration.d.ts",
     "worker:check": "npm run worker:types && tsc --noEmit",
     "worker:test": "vitest run",
     "worker:dev": "wrangler dev --local",
     "worker:deploy": "wrangler deploy",
-    "worker:deploy:check": "wrangler deploy --dry-run",
-    "worker:migrate:local": "wrangler d1 migrations apply liveuser --local"
+    "worker:deploy:check": "wrangler deploy --dry-run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",

@@ -28,7 +28,7 @@ interface VisitRequestBody {
   siteId?: unknown;
 }
 
-interface PageViewRow {
+interface ViewRow {
   pv: number;
 }
 
@@ -46,16 +46,16 @@ export default {
       }
 
       if (request.method === "POST") {
-        return await handlePageView(request, env);
+        return await handleViewIncrement(request, env);
       }
 
       if (request.method === "GET") {
-        return await handlePageViewCount(request, env);
+        return await handleViewCount(request, env);
       }
 
-      const origin = request.headers.get("Origin");
+      const origin = requestOrigin(request);
       const response = jsonResponse({ error: "Method not allowed" }, 405);
-      return origin && siteIdFromOrigin(origin) ? withCors(response, origin) : response;
+      return withOptionalCors(response, origin);
     } catch (error) {
       console.error(JSON.stringify({
         event: "request_failed",
@@ -63,9 +63,9 @@ export default {
         path: url.pathname,
         errorName: error instanceof Error ? error.name : "UnknownError",
       }));
-      const origin = request.headers.get("Origin");
+      const origin = requestOrigin(request);
       const response = jsonResponse({ error: "Internal server error" }, 500);
-      return origin && siteIdFromOrigin(origin) ? withCors(response, origin) : response;
+      return withOptionalCors(response, origin);
     }
   },
 
@@ -93,40 +93,37 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function handlePageView(request: Request, env: Env): Promise<Response> {
-  const origin = request.headers.get("Origin");
-  if (!origin || !siteIdFromOrigin(origin)) {
-    return jsonResponse({ error: "Origin required" }, 400);
-  }
+async function handleViewIncrement(request: Request, env: Env): Promise<Response> {
+  const origin = requestOrigin(request);
 
   const contentType = request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== "application/json") {
-    return withCors(jsonResponse({ error: "Content-Type must be application/json" }, 415), origin);
+    return withOptionalCors(jsonResponse({ error: "Content-Type must be application/json" }, 415), origin);
   }
 
   const contentLength = Number(request.headers.get("Content-Length"));
   if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
-    return withCors(jsonResponse({ error: "Request body too large" }, 413), origin);
+    return withOptionalCors(jsonResponse({ error: "Request body too large" }, 413), origin);
   }
 
   const bodyText = await readLimitedText(request, MAX_REQUEST_BYTES);
   if (bodyText === null) {
-    return withCors(jsonResponse({ error: "Request body too large" }, 413), origin);
+    return withOptionalCors(jsonResponse({ error: "Request body too large" }, 413), origin);
   }
 
   let body: unknown;
   try {
     body = JSON.parse(bodyText);
   } catch {
-    return withCors(jsonResponse({ error: "Invalid JSON" }, 400), origin);
+    return withOptionalCors(jsonResponse({ error: "Invalid JSON" }, 400), origin);
   }
   if (!isVisitRequestBody(body)) {
-    return withCors(jsonResponse({ error: "Invalid request body" }, 400), origin);
+    return withOptionalCors(jsonResponse({ error: "Invalid request body" }, 400), origin);
   }
 
   const siteId = resolveSiteId(body.siteId, origin);
   if (!siteId || !SITE_ID_PATTERN.test(siteId)) {
-    return withCors(jsonResponse({ error: "Invalid siteId" }, 400), origin);
+    return withOptionalCors(jsonResponse({ error: "Invalid siteId" }, 400), origin);
   }
 
   const visitDate = shanghaiDate(new Date());
@@ -142,37 +139,34 @@ async function handlePageView(request: Request, env: Env): Promise<Response> {
        updated_at = excluded.updated_at`,
   ).bind(siteId, visitDate, timestamp).run();
 
-  const pv = await readPageViews(env.DB, siteId, visitDate);
-  return pageViewResponse(siteId, pv, visitDate, timestamp, origin);
+  const pv = await readViewCount(env.DB, siteId, visitDate);
+  return viewResponse(siteId, pv, visitDate, timestamp, origin);
 }
 
-async function handlePageViewCount(request: Request, env: Env): Promise<Response> {
-  const origin = request.headers.get("Origin");
-  if (!origin || !siteIdFromOrigin(origin)) {
-    return jsonResponse({ error: "Origin required" }, 400);
-  }
+async function handleViewCount(request: Request, env: Env): Promise<Response> {
+  const origin = requestOrigin(request);
 
   const url = new URL(request.url);
   const siteId = resolveSiteId(url.searchParams.get("siteId"), origin);
   if (!siteId || !SITE_ID_PATTERN.test(siteId)) {
-    return withCors(jsonResponse({ error: "Invalid siteId" }, 400), origin);
+    return withOptionalCors(jsonResponse({ error: "Invalid siteId" }, 400), origin);
   }
 
   const visitDate = shanghaiDate(new Date());
   const timestamp = Math.floor(Date.now() / 1000);
 
   await ensureDatabaseSchema(env.DB);
-  const pv = await readPageViews(env.DB, siteId, visitDate);
-  return pageViewResponse(siteId, pv, visitDate, timestamp, origin);
+  const pv = await readViewCount(env.DB, siteId, visitDate);
+  return viewResponse(siteId, pv, visitDate, timestamp, origin);
 }
 
 function isVisitRequestBody(value: unknown): value is VisitRequestBody {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function resolveSiteId(value: unknown, origin: string): string | null {
+function resolveSiteId(value: unknown, origin: string | null): string | null {
   if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) {
-    return siteIdFromOrigin(origin);
+    return origin ? siteIdFromOrigin(origin) : null;
   }
   if (typeof value !== "string") {
     return null;
@@ -189,24 +183,24 @@ function siteIdFromOrigin(origin: string): string | null {
   }
 }
 
-async function readPageViews(db: D1Database, siteId: string, visitDate: string): Promise<number> {
+async function readViewCount(db: D1Database, siteId: string, visitDate: string): Promise<number> {
   const row = await db.prepare(
     `SELECT pv
        FROM daily_pageviews
       WHERE site_id = ?1 AND visit_date = ?2`,
-  ).bind(siteId, visitDate).first<PageViewRow>();
+  ).bind(siteId, visitDate).first<ViewRow>();
 
   return Number(row?.pv ?? 0);
 }
 
-function pageViewResponse(
+function viewResponse(
   siteId: string,
   pv: number,
   date: string,
   timestamp: number,
-  origin: string,
+  origin: string | null,
 ): Response {
-  return withCors(jsonResponse({
+  return withOptionalCors(jsonResponse({
     type: "visit",
     siteId,
     pv,
@@ -223,7 +217,7 @@ function handlePreflight(request: Request): Response {
 
   const requestedMethod = request.headers.get("Access-Control-Request-Method");
   if (requestedMethod !== "POST" && requestedMethod !== "GET") {
-    return withCors(jsonResponse({ error: "Method not allowed" }, 405), origin);
+    return withOptionalCors(jsonResponse({ error: "Method not allowed" }, 405), origin);
   }
 
   return withCors(new Response(null, { status: 204 }), origin);
@@ -313,6 +307,15 @@ function jsonResponse(body: unknown, status = 200): Response {
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+function requestOrigin(request: Request): string | null {
+  const origin = request.headers.get("Origin");
+  return origin && siteIdFromOrigin(origin) ? origin : null;
+}
+
+function withOptionalCors(response: Response, origin: string | null): Response {
+  return origin ? withCors(response, origin) : response;
 }
 
 function withCors(response: Response, origin: string): Response {

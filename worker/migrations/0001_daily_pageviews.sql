@@ -1,4 +1,4 @@
--- Stores one aggregate page view counter per site and day.
+-- Stores one aggregate daily view counter per site and day.
 CREATE TABLE IF NOT EXISTS daily_pageviews (
     site_id TEXT NOT NULL,
     visit_date TEXT NOT NULL,

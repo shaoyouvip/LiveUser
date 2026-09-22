@@ -35,29 +35,32 @@ func TestParseJSConfigDoesNotUseReferer(t *testing.T) {
 	}
 }
 
-func TestUpdateMessageIncludesOnlineAndCompatibilityCount(t *testing.T) {
-	encoded, err := json.Marshal(Message{Type: "update", SiteID: "example-site", Online: 0, Count: 0})
+func TestUpdateMessageUsesSingleCountField(t *testing.T) {
+	encoded, err := json.Marshal(Message{Type: "update", SiteID: "example-site", Count: 2})
 	if err != nil {
 		t.Fatalf("marshal message: %v", err)
 	}
 	payload := string(encoded)
-	if !strings.Contains(payload, "\"online\":0") || !strings.Contains(payload, "\"count\":0") {
-		t.Fatalf("update payload must include online and count: %s", payload)
+	if strings.Contains(payload, "\"online\"") {
+		t.Fatalf("update payload must not include the removed online alias: %s", payload)
+	}
+	if !strings.Contains(payload, "\"count\":2") {
+		t.Fatalf("update payload must contain count: %s", payload)
 	}
 }
 
-func TestWebSocketBroadcastsOnlineAndDisconnect(t *testing.T) {
+func TestWebSocketBroadcastsCountAndDisconnect(t *testing.T) {
 	server := newTestWebSocketServer(t)
 	defer server.Close()
 
 	first := dialWebSocket(t, server.URL, "http://example.com")
 	defer first.Close()
-	sendJoin(t, first, "example-site", "11111111-1111-4111-8111-111111111111")
+	sendJoin(t, first, "example-site")
 	assertUpdate(t, first, 1)
 
 	second := dialWebSocket(t, server.URL, "http://example.com")
 	defer second.Close()
-	sendJoin(t, second, "example-site", "22222222-2222-4222-8222-222222222222")
+	sendJoin(t, second, "example-site")
 
 	assertUpdate(t, first, 2)
 	assertUpdate(t, second, 2)
@@ -76,7 +79,7 @@ func TestWebSocketRemovesEmptySiteAfterDisconnect(t *testing.T) {
 	defer server.Close()
 
 	conn := dialWebSocket(t, server.URL, "http://example.com")
-	sendJoin(t, conn, "example-site", "11111111-1111-4111-8111-111111111111")
+	sendJoin(t, conn, "example-site")
 	assertUpdate(t, conn, 1)
 	_ = conn.Close()
 
@@ -104,7 +107,7 @@ func TestBroadcastUsesLatestSiteCount(t *testing.T) {
 	site.broadcastMutex.Lock()
 	done := make(chan struct{})
 	go func() {
-		NewHub().broadcastToSite(site)
+		site.broadcast()
 		close(done)
 	}()
 
@@ -122,8 +125,8 @@ func TestBroadcastUsesLatestSiteCount(t *testing.T) {
 	for _, client := range []*Client{first, second} {
 		select {
 		case message := <-client.send:
-			if message.Online != 2 || message.Count != 2 {
-				t.Fatalf("online/count = %d/%d, want 2/2", message.Online, message.Count)
+			if message.Count != 2 {
+				t.Fatalf("count = %d, want 2", message.Count)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("client did not receive broadcast")
@@ -137,7 +140,7 @@ func TestWebSocketAllowsAnyOrigin(t *testing.T) {
 
 	conn := dialWebSocket(t, server.URL, "https://untrusted.example")
 	defer conn.Close()
-	sendJoin(t, conn, "example-site", "11111111-1111-4111-8111-111111111111")
+	sendJoin(t, conn, "example-site")
 	assertUpdate(t, conn, 1)
 }
 
@@ -147,11 +150,11 @@ func TestWebSocketDerivesSiteIDFromOriginWhenOmitted(t *testing.T) {
 
 	conn := dialWebSocket(t, server.URL, "http://example.com")
 	defer conn.Close()
-	sendJoin(t, conn, "", "11111111-1111-4111-8111-111111111111")
+	sendJoin(t, conn, "")
 
 	message := readMessage(t, conn)
-	if message.Type != "update" || message.SiteID != "example.com" || message.Online != 1 {
-		t.Fatalf("message = %#v, want update for example.com with online 1", message)
+	if message.Type != "update" || message.SiteID != "example.com" || message.Count != 1 {
+		t.Fatalf("message = %#v, want update for example.com with count 1", message)
 	}
 }
 
@@ -161,10 +164,10 @@ func TestWebSocketRejectsDuplicateJoin(t *testing.T) {
 
 	conn := dialWebSocket(t, server.URL, "http://example.com")
 	defer conn.Close()
-	sendJoin(t, conn, "example-site", "11111111-1111-4111-8111-111111111111")
+	sendJoin(t, conn, "example-site")
 	assertUpdate(t, conn, 1)
 
-	sendJoin(t, conn, "example-site", "22222222-2222-4222-8222-222222222222")
+	sendJoin(t, conn, "example-site")
 	message := readMessage(t, conn)
 	if message.Type != "error" || message.Message != "join already completed" {
 		t.Fatalf("message = %#v, want duplicate join rejection", message)
@@ -203,9 +206,9 @@ func webSocketURL(t *testing.T, serverURL string) string {
 	return parsed.String()
 }
 
-func sendJoin(t *testing.T, conn *websocket.Conn, siteID, visitorID string) {
+func sendJoin(t *testing.T, conn *websocket.Conn, siteID string) {
 	t.Helper()
-	payload, err := json.Marshal(incomingMessage{Type: "join", SiteID: siteID, VisitorID: visitorID})
+	payload, err := json.Marshal(incomingMessage{Type: "join", SiteID: siteID})
 	if err != nil {
 		t.Fatalf("marshal join message: %v", err)
 	}
@@ -214,14 +217,14 @@ func sendJoin(t *testing.T, conn *websocket.Conn, siteID, visitorID string) {
 	}
 }
 
-func assertUpdate(t *testing.T, conn *websocket.Conn, wantOnline int) {
+func assertUpdate(t *testing.T, conn *websocket.Conn, wantCount int) {
 	t.Helper()
 	message := readMessage(t, conn)
 	if message.Type != "update" {
 		t.Fatalf("message type = %q, want update", message.Type)
 	}
-	if message.Online != wantOnline || message.Count != wantOnline {
-		t.Fatalf("online/count = %d/%d, want %d/%d", message.Online, message.Count, wantOnline, wantOnline)
+	if message.Count != wantCount {
+		t.Fatalf("count = %d, want %d", message.Count, wantCount)
 	}
 }
 

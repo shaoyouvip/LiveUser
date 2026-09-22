@@ -2,7 +2,7 @@
  * LiveUser browser client.
  *
  * Online count: Go WebSocket service from `serverUrl`.
- * Page views: Cloudflare Worker + D1 endpoint at `/v1/visit`.
+ * Daily views: Cloudflare Worker + D1 endpoint at `/v1/visit`.
  */
 (function() {
     'use strict';
@@ -13,9 +13,7 @@
     }
 
     const CONFIG = {{.JSON}};
-    const VISITOR_STORAGE_PREFIX = 'liveuser:visitorId:';
     const SITE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$/;
-    const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
     function currentSiteID() {
         const hostname = String(window.location.hostname || '').trim().toLowerCase();
@@ -33,7 +31,7 @@
                 return null;
             }
             return url;
-        } catch (error) {
+        } catch {
             return null;
         }
     }
@@ -47,51 +45,16 @@
         return url.toString();
     }
 
-    function visitsURL() {
+    function viewsURL() {
         const url = serviceURL();
         if (!url) {
             return '';
         }
-        try {
-            url.protocol = url.protocol === 'wss:' || url.protocol === 'https:' ? 'https:' : 'http:';
-            url.pathname = '/v1/visit';
-            url.search = '';
-            url.hash = '';
-            return url.toString();
-        } catch (error) {
-            return '';
-        }
-    }
-
-    function createVisitorID() {
-        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-            return crypto.randomUUID();
-        }
-        if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-            const bytes = new Uint8Array(16);
-            crypto.getRandomValues(bytes);
-            bytes[6] = (bytes[6] & 0x0f) | 0x40;
-            bytes[8] = (bytes[8] & 0x3f) | 0x80;
-            const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
-            return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-        }
-        throw new Error('Web Crypto API is required');
-    }
-
-    function loadVisitorID(siteId) {
-        const key = VISITOR_STORAGE_PREFIX + siteId;
-        try {
-            const stored = window.localStorage.getItem(key);
-            if (stored && UUID_PATTERN.test(stored)) {
-                return stored;
-            }
-            const created = createVisitorID();
-            window.localStorage.setItem(key, created);
-            return created;
-        } catch (error) {
-            // Private browsing or strict storage policies may disable localStorage.
-            return createVisitorID();
-        }
+        url.protocol = url.protocol === 'wss:' || url.protocol === 'https:' ? 'https:' : 'http:';
+        url.pathname = '/v1/visit';
+        url.search = '';
+        url.hash = '';
+        return url.toString();
     }
 
     class LiveUser {
@@ -99,14 +62,13 @@
             this.ws = null;
             this.isActive = !document.hidden;
             this.reconnectTimer = null;
-            this.pvWriteController = null;
-            this.pvReadController = null;
-            this.pvRefreshTimer = null;
-            this.currentOnline = null;
-            this.currentPV = null;
+            this.viewWriteController = null;
+            this.viewReadController = null;
+            this.viewRefreshTimer = null;
+            this.currentCount = null;
+            this.currentViews = null;
             this.displayElement = null;
             this.siteId = String(CONFIG.siteId || '').trim().toLowerCase() || currentSiteID();
-            this.visitorId = null;
             this.initialized = false;
         }
 
@@ -119,12 +81,11 @@
                 return;
             }
 
-            this.visitorId = loadVisitorID(this.siteId);
             this.initialized = true;
             this.log('LiveUser 初始化，站点: ' + this.siteId);
-            this.recordPageView();
+            this.recordView();
             this.connect();
-            this.pvRefreshTimer = window.setInterval(() => this.refreshPageViews(), 5 * 60 * 1000);
+            this.viewRefreshTimer = window.setInterval(() => this.refreshViews(), 5 * 60 * 1000);
         }
 
         checkDisplayElement() {
@@ -140,15 +101,15 @@
 
             window.addEventListener('online', () => {
                 this.log('网络恢复');
-                this.refreshPageViews();
+                this.refreshViews();
                 this.connect();
             });
 
             const close = () => {
                 this.isActive = false;
-                // Let the PV request finish so an immediate refresh is still counted.
-                if (this.pvReadController) {
-                    this.pvReadController.abort();
+                // 让浏览量请求完成，保证紧接着的刷新也能被计入。
+                if (this.viewReadController) {
+                    this.viewReadController.abort();
                 }
                 if (this.ws) {
                     this.ws.close(1000, 'page closed');
@@ -163,7 +124,7 @@
             if (!this.isActive) {
                 return;
             }
-            this.refreshPageViews();
+            this.refreshViews();
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
                 this.connect();
             }
@@ -202,11 +163,7 @@
                 if (this.ws !== socket) {
                     return;
                 }
-                socket.send(JSON.stringify({
-                    type: 'join',
-                    siteId: this.siteId,
-                    visitorId: this.visitorId
-                }));
+                socket.send(JSON.stringify({ type: 'join', siteId: this.siteId }));
             };
 
             socket.onmessage = event => {
@@ -215,7 +172,7 @@
                 }
                 try {
                     this.handleMessage(JSON.parse(event.data));
-                } catch (error) {
+                } catch {
                     this.log('消息解析失败');
                 }
             };
@@ -235,15 +192,16 @@
         }
 
         handleMessage(data) {
-            if (!data || data.siteId !== this.siteId) {
+            if (!data) {
                 return;
             }
             if (data.type === 'update') {
-                const online = Number(data.online);
-                const fallback = Number(data.count);
-                const value = Number.isFinite(online) ? online : fallback;
-                if (Number.isFinite(value) && value >= 0) {
-                    this.currentOnline = value;
+                if (data.siteId !== this.siteId) {
+                    return;
+                }
+                const count = Number(data.count);
+                if (Number.isFinite(count) && count >= 0) {
+                    this.currentCount = count;
                     this.render();
                     this.emitUpdate('websocket');
                 }
@@ -258,19 +216,19 @@
             }
         }
 
-        recordPageView() {
+        recordView() {
             if (!this.initialized || !this.isActive) {
                 return;
             }
-            const url = visitsURL();
+            const url = viewsURL();
             if (!url) {
                 return;
             }
-            if (this.pvWriteController) {
-                this.pvWriteController.abort();
+            if (this.viewWriteController) {
+                this.viewWriteController.abort();
             }
             const controller = new AbortController();
-            this.pvWriteController = controller;
+            this.viewWriteController = controller;
 
             fetch(url, {
                 method: 'POST',
@@ -287,36 +245,36 @@
                 }
                 return response.json();
             }).then(data => {
-                if (this.pvWriteController !== controller) {
+                if (this.viewWriteController !== controller) {
                     return;
                 }
-                this.updatePageViews(data);
+                this.updateViews(data);
             }).catch(error => {
                 if (error.name !== 'AbortError') {
-                    this.log('访问统计失败: ' + error.message);
+                    this.log('浏览量统计失败: ' + error.message);
                 }
             }).finally(() => {
-                if (this.pvWriteController === controller) {
-                    this.pvWriteController = null;
+                if (this.viewWriteController === controller) {
+                    this.viewWriteController = null;
                 }
             });
         }
 
-        refreshPageViews() {
-            if (!this.initialized || !this.isActive || this.pvWriteController) {
+        refreshViews() {
+            if (!this.initialized || !this.isActive || this.viewWriteController) {
                 return;
             }
-            const url = visitsURL();
+            const url = viewsURL();
             if (!url) {
                 return;
             }
             const requestURL = new URL(url);
             requestURL.searchParams.set('siteId', this.siteId);
-            if (this.pvReadController) {
-                this.pvReadController.abort();
+            if (this.viewReadController) {
+                this.viewReadController.abort();
             }
             const controller = new AbortController();
-            this.pvReadController = controller;
+            this.viewReadController = controller;
 
             fetch(requestURL.toString(), {
                 method: 'GET',
@@ -330,30 +288,30 @@
                 }
                 return response.json();
             }).then(data => {
-                if (this.pvReadController !== controller) {
+                if (this.viewReadController !== controller) {
                     return;
                 }
-                this.updatePageViews(data);
+                this.updateViews(data);
             }).catch(error => {
                 if (error.name !== 'AbortError') {
-                    this.log('访问统计失败: ' + error.message);
+                    this.log('浏览量统计失败: ' + error.message);
                 }
             }).finally(() => {
-                if (this.pvReadController === controller) {
-                    this.pvReadController = null;
+                if (this.viewReadController === controller) {
+                    this.viewReadController = null;
                 }
             });
         }
 
-        updatePageViews(data) {
+        updateViews(data) {
             if (!data || data.siteId !== this.siteId) {
                 return;
             }
-            const pv = Number(data.pv);
-            if (Number.isFinite(pv) && pv >= 0) {
-                this.currentPV = pv;
+            const views = Number(data.pv);
+            if (Number.isFinite(views) && views >= 0) {
+                this.currentViews = views;
                 this.render();
-                this.emitUpdate('pv');
+                this.emitUpdate('views');
             }
         }
 
@@ -365,11 +323,11 @@
                 return;
             }
             const parts = [];
-            if (this.currentOnline !== null) {
-                parts.push('在线 ' + this.currentOnline);
+            if (this.currentCount !== null) {
+                parts.push('在线 ' + this.currentCount);
             }
-            if (this.currentPV !== null) {
-                parts.push('访问 ' + this.currentPV);
+            if (this.currentViews !== null) {
+                parts.push('浏览量 ' + this.currentViews);
             }
             if (parts.length > 0) {
                 this.displayElement.textContent = parts.join(' · ');
@@ -382,9 +340,8 @@
             const event = new CustomEvent('liveuser:update', {
                 detail: {
                     siteId: this.siteId,
-                    online: this.currentOnline,
-                    pv: this.currentPV,
-                    count: this.currentOnline,
+                    count: this.currentCount,
+                    views: this.currentViews,
                     reason: reason
                 }
             });
@@ -407,11 +364,11 @@
         }
 
         getCount() {
-            return this.currentOnline === null ? 0 : this.currentOnline;
+            return this.currentCount === null ? 0 : this.currentCount;
         }
 
-        getPV() {
-            return this.currentPV === null ? 0 : this.currentPV;
+        getViews() {
+            return this.currentViews === null ? 0 : this.currentViews;
         }
 
         getStatus() {
@@ -432,17 +389,17 @@
                 window.clearTimeout(this.reconnectTimer);
                 this.reconnectTimer = null;
             }
-            if (this.pvRefreshTimer) {
-                window.clearInterval(this.pvRefreshTimer);
-                this.pvRefreshTimer = null;
+            if (this.viewRefreshTimer) {
+                window.clearInterval(this.viewRefreshTimer);
+                this.viewRefreshTimer = null;
             }
-            if (this.pvWriteController) {
-                this.pvWriteController.abort();
-                this.pvWriteController = null;
+            if (this.viewWriteController) {
+                this.viewWriteController.abort();
+                this.viewWriteController = null;
             }
-            if (this.pvReadController) {
-                this.pvReadController.abort();
-                this.pvReadController = null;
+            if (this.viewReadController) {
+                this.viewReadController.abort();
+                this.viewReadController = null;
             }
             if (this.ws) {
                 this.ws.close(1000, 'manual disconnect');
@@ -469,8 +426,8 @@
         window.getLiveUserCount = function() {
             return window.LiveUser ? window.LiveUser.getCount() : 0;
         };
-        window.getLiveUserPV = function() {
-            return window.LiveUser ? window.LiveUser.getPV() : 0;
+        window.getLiveUserViews = function() {
+            return window.LiveUser ? window.LiveUser.getViews() : 0;
         };
         window.getLiveUserStatus = function() {
             return window.LiveUser ? window.LiveUser.getStatus() : 'not-initialized';

@@ -22,10 +22,10 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM daily_pageviews").run();
 });
 
-describe("daily page view Worker", () => {
+describe("daily view Worker", () => {
   it("counts every request without deduplication", async () => {
-    const first = await postPageView("example-site");
-    const second = await postPageView("example-site");
+    const first = await postView("example-site");
+    const second = await postView("example-site");
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
@@ -35,10 +35,10 @@ describe("daily page view Worker", () => {
     expect(secondBody.pv).toBe(2);
   });
 
-  it("keeps page view counters separate for different sites", async () => {
-    const first = await postPageView("site-a");
-    const other = await postPageView("site-b");
-    const second = await postPageView("site-a");
+  it("keeps view counters separate for different sites", async () => {
+    const first = await postView("site-a");
+    const other = await postView("site-b");
+    const second = await postView("site-a");
 
     expect((await first.json<{ pv: number }>()).pv).toBe(1);
     expect((await other.json<{ pv: number }>()).pv).toBe(1);
@@ -61,25 +61,52 @@ describe("daily page view Worker", () => {
   });
 
   it("derives the siteId from Origin when omitted", async () => {
-    const response = await postPageView(undefined);
+    const response = await postView(undefined);
     expect(response.status).toBe(200);
     const body = await response.json<{ siteId: string }>();
     expect(body.siteId).toBe("localhost");
   });
 
   it("accepts an explicit siteId as a partition override", async () => {
-    const response = await postPageView("blog.example.com");
+    const response = await postView("blog.example.com");
     expect(response.status).toBe(200);
     const body = await response.json<{ siteId: string }>();
     expect(body.siteId).toBe("blog.example.com");
   });
 
-  it("returns the current page view count without incrementing it", async () => {
-    await postPageView("example-site");
-    await postPageView("example-site");
+  it("accepts an explicit siteId without an Origin header", async () => {
+    const response = await SELF.fetch("https://worker.test/v1/visit", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ siteId: "server-to-server.example" }),
+    });
 
-    const first = await getPageViews("example-site");
-    const second = await getPageViews("example-site");
+    expect(response.status).toBe(200);
+    const body = await response.json<{ siteId: string; pv: number }>();
+    expect(body.siteId).toBe("server-to-server.example");
+    expect(body.pv).toBe(1);
+  });
+
+  it("rejects an omitted siteId when Origin cannot derive one", async () => {
+    const response = await SELF.fetch("https://worker.test/v1/visit", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("returns the current view count without incrementing it", async () => {
+    await postView("example-site");
+    await postView("example-site");
+
+    const first = await getViewCount("example-site");
+    const second = await getViewCount("example-site");
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
@@ -88,7 +115,7 @@ describe("daily page view Worker", () => {
   });
 
   it("rejects malformed site identifiers", async () => {
-    const response = await postPageView("not a site id");
+    const response = await postView("not a site id");
     expect(response.status).toBe(400);
   });
 
@@ -142,7 +169,7 @@ describe("daily page view Worker", () => {
   });
 });
 
-function postPageView(siteId: string | undefined): Promise<Response> {
+function postView(siteId: string | undefined): Promise<Response> {
   return SELF.fetch("https://worker.test/v1/visit", {
     method: "POST",
     headers: {
@@ -153,7 +180,7 @@ function postPageView(siteId: string | undefined): Promise<Response> {
   });
 }
 
-function getPageViews(siteId: string | undefined): Promise<Response> {
+function getViewCount(siteId: string | undefined): Promise<Response> {
   const url = new URL("https://worker.test/v1/visit");
   if (siteId) {
     url.searchParams.set("siteId", siteId);

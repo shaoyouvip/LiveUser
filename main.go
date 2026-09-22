@@ -31,10 +31,7 @@ const (
 	maxReconnectDelayMilli     = 60000
 )
 
-var (
-	siteIDPattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$`)
-	visitorIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
-)
+var siteIDPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$`)
 
 // Version is set by the build pipeline.
 var Version = "dev"
@@ -48,17 +45,15 @@ var mainJS string
 var scriptTemplate = template.Must(template.New("liveuser").Parse(mainJS))
 
 type incomingMessage struct {
-	Type      string `json:"type"`
-	SiteID    string `json:"siteId,omitempty"`
-	VisitorID string `json:"visitorId,omitempty"`
+	Type   string `json:"type"`
+	SiteID string `json:"siteId,omitempty"`
 }
 
 // Message is the server-to-client WebSocket message.
 type Message struct {
 	Type      string `json:"type"`
 	SiteID    string `json:"siteId,omitempty"`
-	Online    int    `json:"online"`
-	Count     int    `json:"count"`
+	Count     int    `json:"count,omitempty"`
 	Message   string `json:"message,omitempty"`
 	Timestamp int64  `json:"timestamp,omitempty"`
 }
@@ -114,7 +109,7 @@ func (h *Hub) register(client *Client) {
 	site.mutex.Unlock()
 	h.mutex.Unlock()
 
-	h.broadcastToSite(site)
+	site.broadcast()
 }
 
 func (h *Hub) unregister(client *Client) {
@@ -141,10 +136,10 @@ func (h *Hub) unregister(client *Client) {
 	site.mutex.Unlock()
 	h.mutex.Unlock()
 
-	h.broadcastToSite(site)
+	site.broadcast()
 }
 
-func (h *Hub) broadcastToSite(site *Site) {
+func (site *Site) broadcast() {
 	site.broadcastMutex.Lock()
 	defer site.broadcastMutex.Unlock()
 
@@ -159,7 +154,6 @@ func (h *Hub) broadcastToSite(site *Site) {
 	message := Message{
 		Type:      "update",
 		SiteID:    site.id,
-		Online:    count,
 		Count:     count,
 		Timestamp: time.Now().Unix(),
 	}
@@ -229,14 +223,11 @@ func (c *Client) close() {
 	})
 }
 
-func (c *Client) sendMessage(message Message) bool {
+func (c *Client) sendMessage(message Message) {
 	select {
 	case c.send <- message:
-		return true
 	case <-c.done:
-		return false
 	default:
-		return false
 	}
 }
 
@@ -279,11 +270,6 @@ func (c *Client) readPump() {
 			c.sendError("invalid siteId")
 			continue
 		}
-		if !visitorIDPattern.MatchString(message.VisitorID) {
-			c.sendError("invalid visitorId")
-			continue
-		}
-
 		c.siteID = siteID
 		c.hub.register(c)
 	}

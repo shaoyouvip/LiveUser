@@ -6,7 +6,7 @@ beforeAll(async () => {
 });
 
 describe("D1 schema initialization", () => {
-  it("creates the table and index before the first page view", async () => {
+  it("creates the table and index before the first view", async () => {
     const before = await env.DB.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_pageviews'",
     ).first<{ name: string }>();
