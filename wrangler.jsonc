@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "liveuser-visits",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "liveuser-visits",
+      "migrations_dir": "worker/migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    "crons": [
+      "17 * * * *"
+    ]
+  },
+  "secrets": {
+    "required": [
+      "VISITOR_HMAC_SECRET"
+    ]
+  }
+}

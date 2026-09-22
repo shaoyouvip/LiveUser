@@ -1,0 +1,26 @@
+* text=auto eol=lf
+
+*.go text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.sql text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.exe binary
+*.sqlite binary
+*.sqlite3 binary
+*.db binary
+worker-configuration.d.ts -whitespace

@@ -1,0 +1,23 @@
+{
+  "name": "liveuser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LiveUser online and daily visitor statistics services",
+  "scripts": {
+    "worker:types": "wrangler types worker-configuration.d.ts",
+    "worker:check": "npm run worker:types && tsc --noEmit",
+    "worker:test": "vitest run",
+    "worker:dev": "wrangler dev --local",
+    "worker:deploy:check": "wrangler deploy --dry-run",
+    "worker:migrate:local": "wrangler d1 migrations apply liveuser-visits --local",
+    "worker:migrate:remote": "wrangler d1 migrations apply liveuser-visits --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@types/node": "24.10.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.136.1"
+  },
+  "type": "module"
+}

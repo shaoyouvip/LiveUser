@@ -1,279 +1,92 @@
-name: LiveUser
+name: LiveUser CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      release_type:
-        description: '发布类型'
-        required: true
-        default: 'Beta'
-        type: choice
-        options:
-          - Beta
-          - Release
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
-  GO_VERSION: "1.23"
-  BINARY_NAME: "liveuser"
-  DOCKER_IMAGE: "liveuser"
-  MODULE_NAME: "github.com/${{ github.repository }}"
+  GO_VERSION: "1.23.12"
+  NODE_VERSION: "22"
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/liveuser
 
 jobs:
-  lint:
-    name: 代码检查
+  go:
+    name: Go checks
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 Go 环境
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: false
+          cache: true
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+      - name: Test
+        run: go test ./...
+      - name: Race test
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: CGO_ENABLED=0 go build -trimpath -o /tmp/liveuser .
 
-      - name: 验证文件
-        run: |
-          required_files=("main.go" "main.js" "demo.html" "Dockerfile")
-          for file in "${required_files[@]}"; do
-            if [ ! -f "$file" ]; then
-              echo "缺少文件: $file"
-              exit 1
-            fi
-          done
-          echo "✅ 静态文件将内置到二进制中"
-
-      - name: 代码检查
-        run: |
-          if [ ! -f go.mod ]; then
-            go mod init ${{ env.MODULE_NAME }}
-          fi
-          go get github.com/gorilla/websocket@latest
-          go mod tidy
-          go fmt ./...
-          go vet ./...
-          go build -o /tmp/test .
-          rm -f /tmp/test
-
-  version:
-    name: 版本处理
+  worker:
+    name: Worker checks
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    needs: lint
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      is_release: ${{ steps.version.outputs.is_release }}
+    env:
+      VISITOR_HMAC_SECRET: ci-only-liveuser-secret-0123456789abcdef
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install
+        run: npm ci --legacy-peer-deps
+      - name: Type check
+        run: npm run worker:check
+      - name: Generated types are current
+        run: git diff --exit-code -- worker-configuration.d.ts
+      - name: Test
+        run: npm run worker:test
+      - name: Wrangler dry run
+        run: npm run worker:deploy:check
 
-      - name: 计算版本号
-        id: version
-        run: |
-          echo "is_release=${{ github.event.inputs.release_type == 'Release' }}" >> $GITHUB_OUTPUT
-          
-          latest_tag=$(git tag -l "v*" --sort=-version:refname | head -n1 || echo "v0.0.0")
-          
-          if [[ $latest_tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            major=${BASH_REMATCH[1]}
-            minor=${BASH_REMATCH[2]}
-            patch=${BASH_REMATCH[3]}
-          else
-            major=0
-            minor=0
-            patch=0
-          fi
-          
-          patch=$((patch + 1))
-          new_version="v${major}.${minor}.${patch}"
-          echo "version=$new_version" >> $GITHUB_OUTPUT
-
-      - name: 创建标签
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.version.outputs.version }}" -m "Release ${{ steps.version.outputs.version }}"
-          git push origin "${{ steps.version.outputs.version }}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-and-release:
-    name: 构建
+  image:
+    name: Build or publish GHCR image
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    needs: version
-    strategy:
-      matrix:
-        include:
-          - { os: linux, arch: amd64 }
-          - { os: linux, arch: arm64 }
-          - { os: darwin, arch: amd64 }
-          - { os: darwin, arch: arm64 }
-          - { os: windows, arch: amd64 }
-          - { os: windows, arch: arm64 }
-          - { os: freebsd, arch: amd64 }
-          - { os: freebsd, arch: arm64 }
+    needs: [go, worker]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 Go 环境
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
         with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
-      - name: 准备依赖
-        run: |
-          if [ ! -f go.mod ]; then
-            go mod init ${{ env.MODULE_NAME }}
-          fi
-          go get github.com/gorilla/websocket@latest
-          go mod tidy
-
-      - name: 构建二进制
-        env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-          CGO_ENABLED: 0
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          binary_name="${{ env.BINARY_NAME }}"
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            binary_name="${binary_name}.exe"
-          fi
-          
-          echo "🔨 构建 ${{ matrix.os }}/${{ matrix.arch }} 平台"
-          go build \
-            -trimpath \
-            -ldflags="-s -w -X main.Version=${VERSION}" \
-            -o "${binary_name}" \
-            .
-          
-          mkdir -p dist
-          package_name="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
-          
-          # 只打包二进制文件（静态文件已内置）
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            zip -9 "dist/${package_name}.zip" "${binary_name}"
-            echo "✅ 已创建: ${package_name}.zip"
-          else
-            tar -czf "dist/${package_name}.tar.gz" "${binary_name}"
-            echo "✅ 已创建: ${package_name}.tar.gz"
-          fi
-
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image
+        uses: docker/build-push-action@v6
         with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: dist/
-          retention-days: 1
-
-  github-release:
-    name: 发布
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    needs: [version, build-and-release]
-    steps:
-      - name: 下载构建产物
-        uses: actions/download-artifact@v4
-        with:
-          pattern: build-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: 整理发布文件
-        run: |
-          mkdir -p release
-          echo "📥 收集构建产物"
-          find artifacts -name "*.zip" -o -name "*.tar.gz" | while read file; do
-            filename=$(basename "$file")
-            cp "$file" "release/$filename"
-            echo "✅ 已添加: $filename"
-          done
-          
-          echo "🔒 生成 SHA256 校验和"
-          cd release
-          sha256sum *.zip *.tar.gz > checksums.txt 2>/dev/null || sha256sum * > checksums.txt
-          
-          echo "📋 发布清单:"
-          ls -lh
-
-      - name: 生成发布说明
-        run: |
-          echo "**SHA256:**" > release_notes.md
-          echo '```' >> release_notes.md
-          cat release/checksums.txt >> release_notes.md
-          echo '```' >> release_notes.md
-
-      - name: 创建 Release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: ${{ needs.version.outputs.version }}
-          name: "${{ needs.version.outputs.version }}"
-          bodyFile: release_notes.md
-          artifacts: "release/*"
-          draft: false
-          prerelease: ${{ needs.version.outputs.is_release != 'true' }}
-          generateReleaseNotes: false
-          allowUpdates: true
-          removeArtifacts: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  docker:
-    name: Docker 构建
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    needs: version
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: 设置 Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: 登录 Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: 构建并推送镜像 (Beta)
-        if: ${{ needs.version.outputs.is_release != 'true' }}
-        run: |
-          echo "🐳 构建 Docker 镜像 (预发布版)"
-          docker buildx build \
-            --build-arg VERSION="${{ needs.version.outputs.version }}" \
-            --platform linux/amd64,linux/arm64 \
-            --tag "${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ needs.version.outputs.version }}" \
-            --tag "${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:beta" \
-            --push \
-            .
-          echo "✅ Docker 镜像推送完成"
-
-      - name: 构建并推送镜像 (Release)
-        if: ${{ needs.version.outputs.is_release == 'true' }}
-        run: |
-          echo "🐳 构建 Docker 镜像 (正式版)"
-          docker buildx build \
-            --build-arg VERSION="${{ needs.version.outputs.version }}" \
-            --platform linux/amd64,linux/arm64 \
-            --tag "${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ needs.version.outputs.version }}" \
-            --tag "${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest" \
-            --push \
-            .
-          echo "✅ Docker 镜像推送完成"
+          context: .
+          push: ${{ github.event_name == 'workflow_dispatch' }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

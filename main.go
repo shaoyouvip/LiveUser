@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,51 +21,48 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// 版本信息
+const (
+	maxMessageBytes            = 1024
+	writeWait                  = 10 * time.Second
+	pongWait                   = 60 * time.Second
+	pingPeriod                 = (pongWait * 9) / 10
+	defaultReconnectDelayMilli = 5000
+	minReconnectDelayMilli     = 1000
+	maxReconnectDelayMilli     = 60000
+)
+
+var (
+	siteIDPattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$`)
+	visitorIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+)
+
+// Version is set by the build pipeline.
 var Version = "dev"
 
-// 内置静态文件
 //go:embed demo.html
 var demoHTML string
 
 //go:embed main.js
 var mainJS string
 
-// 站点数据结构
-type Site struct {
-	ID          string           `json:"id"`
-	Count       int              `json:"count"`
-	Connections map[*Client]bool `json:"-"`
-	mutex       sync.RWMutex     `json:"-"`
+var scriptTemplate = template.Must(template.New("liveuser").Parse(mainJS))
+
+type incomingMessage struct {
+	Type      string `json:"type"`
+	SiteID    string `json:"siteId,omitempty"`
+	VisitorID string `json:"visitorId,omitempty"`
 }
 
-// 客户端连接
-type Client struct {
-	conn *websocket.Conn
-	site *Site
-	hub  *Hub
-	send chan Message
-	ip   string
-}
-
-// 连接管理器
-type Hub struct {
-	sites      map[string]*Site
-	register   chan *Client
-	unregister chan *Client
-	mutex      sync.RWMutex
-}
-
-// 消息结构
+// Message is the server-to-client WebSocket message.
 type Message struct {
 	Type      string `json:"type"`
 	SiteID    string `json:"siteId,omitempty"`
-	Count     int    `json:"count,omitempty"`
+	Online    int    `json:"online"`
+	Count     int    `json:"count"`
 	Message   string `json:"message,omitempty"`
 	Timestamp int64  `json:"timestamp,omitempty"`
 }
 
-// JavaScript 配置结构
 type JSConfig struct {
 	ServerURL        string `json:"serverUrl"`
 	SiteID           string `json:"siteId"`
@@ -72,406 +71,417 @@ type JSConfig struct {
 	Debug            bool   `json:"debug"`
 }
 
-// WebSocket 升级器
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  512,
-	WriteBufferSize: 512,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+func (c JSConfig) JSON() string {
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		return `{}`
+	}
+	return string(encoded)
 }
 
-// 全局变量
-var hub *Hub
+type Site struct {
+	id             string
+	clients        map[*Client]struct{}
+	mutex          sync.RWMutex
+	broadcastMutex sync.Mutex
+}
 
-// 命令行参数
-var addr = flag.String("addr", "0.0.0.0:10086", "监听地址")
+type Hub struct {
+	sites map[string]*Site
+	mutex sync.RWMutex
+}
 
-// 创建新的Hub
 func NewHub() *Hub {
-	return &Hub{
-		sites:      make(map[string]*Site),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-	}
+	return &Hub{sites: make(map[string]*Site)}
 }
 
-// Hub 主循环
-func (h *Hub) Run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.handleRegister(client)
-		case client := <-h.unregister:
-			h.handleUnregister(client)
-		}
-	}
-}
-
-// 处理客户端注册
-func (h *Hub) handleRegister(client *Client) {
-	if client.site == nil {
+func (h *Hub) register(client *Client) {
+	if client.site != nil || client.joined {
 		return
 	}
 
-	site := client.site
+	h.mutex.Lock()
+	site := h.sites[client.siteID]
+	if site == nil {
+		site = &Site{id: client.siteID, clients: make(map[*Client]struct{})}
+		h.sites[client.siteID] = site
+	}
+
 	site.mutex.Lock()
-	site.Connections[client] = true
-	site.Count++
-	count := site.Count
+	site.clients[client] = struct{}{}
+	client.site = site
+	client.joined = true
 	site.mutex.Unlock()
+	h.mutex.Unlock()
 
-	log.Printf("客户端 %s 加入站点 %s，在线: %d", client.ip, site.ID, count)
-	h.broadcastToSite(site.ID, count)
+	h.broadcastToSite(site)
 }
 
-// 处理客户端注销
-func (h *Hub) handleUnregister(client *Client) {
-	if client.site == nil {
+func (h *Hub) unregister(client *Client) {
+	h.mutex.Lock()
+	site := client.site
+	if site == nil {
+		h.mutex.Unlock()
 		return
 	}
 
-	site := client.site
 	site.mutex.Lock()
-
-	if _, exists := site.Connections[client]; exists {
-		delete(site.Connections, client)
-		close(client.send)
-		site.Count--
-		if site.Count < 0 {
-			site.Count = 0
-		}
-		count := site.Count
-		connectionsLeft := len(site.Connections)
+	if _, exists := site.clients[client]; !exists {
 		site.mutex.Unlock()
-
-		log.Printf("客户端 %s 离开站点 %s，在线: %d", client.ip, site.ID, count)
-
-		if connectionsLeft == 0 {
-			h.mutex.Lock()
-			delete(h.sites, site.ID)
-			h.mutex.Unlock()
-		} else {
-			h.broadcastToSite(site.ID, count)
-		}
-	} else {
-		site.mutex.Unlock()
+		h.mutex.Unlock()
+		return
 	}
+	delete(site.clients, client)
+	client.site = nil
+	client.joined = false
+	count := len(site.clients)
+	if count == 0 && h.sites[site.id] == site {
+		delete(h.sites, site.id)
+	}
+	site.mutex.Unlock()
+	h.mutex.Unlock()
+
+	h.broadcastToSite(site)
 }
 
-// 向指定站点广播消息
-func (h *Hub) broadcastToSite(siteID string, count int) {
+func (h *Hub) broadcastToSite(site *Site) {
+	site.broadcastMutex.Lock()
+	defer site.broadcastMutex.Unlock()
+
+	site.mutex.RLock()
+	count := len(site.clients)
+	clients := make([]*Client, 0, count)
+	for client := range site.clients {
+		clients = append(clients, client)
+	}
+	site.mutex.RUnlock()
+
 	message := Message{
 		Type:      "update",
-		SiteID:    siteID,
+		SiteID:    site.id,
+		Online:    count,
 		Count:     count,
 		Timestamp: time.Now().Unix(),
 	}
-
-	h.mutex.RLock()
-	site, exists := h.sites[siteID]
-	h.mutex.RUnlock()
-
-	if !exists {
-		return
-	}
-
-	site.mutex.RLock()
-	defer site.mutex.RUnlock()
-
-	for client := range site.Connections {
+	for _, client := range clients {
 		select {
 		case client.send <- message:
 		default:
-			delete(site.Connections, client)
-			close(client.send)
+			// A slow client must not block broadcasts. Closing its socket makes
+			// the read pump perform the normal unregister cleanup.
+			client.close()
 		}
 	}
 }
 
-// 获取或创建站点
-func (h *Hub) getSite(siteID string) *Site {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
+func (h *Hub) sendShutdown(message Message) {
+	h.mutex.RLock()
+	sites := make([]*Site, 0, len(h.sites))
+	for _, site := range h.sites {
+		sites = append(sites, site)
+	}
+	h.mutex.RUnlock()
 
-	site, exists := h.sites[siteID]
-	if !exists {
-		site = &Site{
-			ID:          siteID,
-			Count:       0,
-			Connections: make(map[*Client]bool),
+	for _, site := range sites {
+		site.mutex.RLock()
+		clients := make([]*Client, 0, len(site.clients))
+		for client := range site.clients {
+			clients = append(clients, client)
 		}
-		h.sites[siteID] = site
-	}
+		site.mutex.RUnlock()
 
-	return site
+		for _, client := range clients {
+			select {
+			case client.send <- message:
+			default:
+			}
+			client.close()
+		}
+	}
 }
 
-// 获取客户端真实IP
-func getRealIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return strings.Split(ip, ",")[0]
-	}
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
-		return ip
-	}
-	return r.RemoteAddr
+type Client struct {
+	conn          *websocket.Conn
+	hub           *Hub
+	send          chan Message
+	done          chan struct{}
+	closeOnce     sync.Once
+	defaultSiteID string
+	siteID        string
+	site          *Site
+	joined        bool
 }
 
-// 检查是否为WebSocket请求
-func isWebSocketRequest(r *http.Request) bool {
-	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
+func newClient(conn *websocket.Conn, hub *Hub, defaultSiteID string) *Client {
+	return &Client{
+		conn:          conn,
+		hub:           hub,
+		send:          make(chan Message, 32),
+		done:          make(chan struct{}),
+		defaultSiteID: defaultSiteID,
+	}
 }
 
-// 处理所有请求
-func handleRequest(w http.ResponseWriter, r *http.Request) {
-	if isWebSocketRequest(r) {
-		handleWebSocket(w, r)
-		return
-	}
+func (c *Client) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
+	})
+}
 
-	if r.Method == "GET" {
-		if strings.HasSuffix(r.URL.Path, ".js") {
-			handleJavaScript(w, r)
+func (c *Client) sendMessage(message Message) bool {
+	select {
+	case c.send <- message:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister(c)
+		c.close()
+	}()
+
+	c.conn.SetReadLimit(maxMessageBytes)
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	for {
+		_, payload, err := c.conn.ReadMessage()
+		if err != nil {
 			return
 		}
-		handleDemoPage(w, r)
+
+		var message incomingMessage
+		if err := json.Unmarshal(payload, &message); err != nil {
+			c.sendError("invalid JSON")
+			continue
+		}
+		if message.Type != "join" {
+			c.sendError("unsupported message type")
+			continue
+		}
+		if c.joined {
+			c.sendError("join already completed")
+			continue
+		}
+		siteID := strings.ToLower(strings.TrimSpace(message.SiteID))
+		if siteID == "" {
+			siteID = c.defaultSiteID
+		}
+		if !siteIDPattern.MatchString(siteID) {
+			c.sendError("invalid siteId")
+			continue
+		}
+		if !visitorIDPattern.MatchString(message.VisitorID) {
+			c.sendError("invalid visitorId")
+			continue
+		}
+
+		c.siteID = siteID
+		c.hub.register(c)
+	}
+}
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	defer c.close()
+
+	for {
+		select {
+		case message := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteJSON(message); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *Client) sendError(message string) {
+	c.sendMessage(Message{Type: "error", Message: message, Timestamp: time.Now().Unix()})
+}
+
+type App struct {
+	hub      *Hub
+	upgrader websocket.Upgrader
+}
+
+func NewApp() *App {
+	return &App{
+		hub: NewHub(),
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true
+			},
+		},
+	}
+}
+
+func (a *App) handleRequest(w http.ResponseWriter, r *http.Request) {
+	if isWebSocketRequest(r) {
+		a.handleWebSocket(w, r)
 		return
 	}
 
-	http.Error(w, "Bad Request", http.StatusBadRequest)
+	if r.Method == http.MethodGet && r.URL.Path == "/liveuser.js" {
+		a.handleJavaScript(w, r)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/" {
+		a.handleDemoPage(w)
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
-// 处理JavaScript文件请求
-func handleJavaScript(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleJavaScript(w http.ResponseWriter, r *http.Request) {
 	config := parseJSConfig(r)
-
-	tmpl, err := template.New("liveuser").Parse(mainJS)
-	if err != nil {
-		http.Error(w, "Template error", http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-
-	tmpl.Execute(w, config)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if err := scriptTemplate.Execute(w, config); err != nil {
+		log.Printf("failed to render liveuser.js: %v", err)
+	}
 }
 
-// 解析JavaScript配置
 func parseJSConfig(r *http.Request) JSConfig {
 	params := r.URL.Query()
-
-	protocol := "ws"
-	if r.Header.Get("X-Forwarded-Proto") == "https" || r.TLS != nil {
-		protocol = "wss"
+	requestScheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		requestScheme = "https"
 	}
-	defaultServerURL := protocol + "://" + r.Host + "/"
+	wsScheme := "ws"
+	if requestScheme == "https" {
+		wsScheme = "wss"
+	}
+	defaultServerURL := wsScheme + "://" + r.Host + "/"
 
-	config := JSConfig{
+	return JSConfig{
 		ServerURL:        getParam(params, "serverUrl", defaultServerURL),
 		SiteID:           getParam(params, "siteId", ""),
 		DisplayElementID: getParam(params, "displayElementId", "liveuser"),
-		ReconnectDelay:   getIntParam(params, "reconnectDelay", 3000),
-		Debug:            getBoolParam(params, "debug", true),
+		ReconnectDelay:   getClampedIntParam(params, "reconnectDelay", defaultReconnectDelayMilli, minReconnectDelayMilli, maxReconnectDelayMilli),
+		Debug:            getBoolParam(params, "debug", false),
 	}
-
-	if config.SiteID == "" {
-		referer := r.Header.Get("Referer")
-		if referer != "" {
-			if u, err := url.Parse(referer); err == nil {
-				config.SiteID = u.Host
-			}
-		}
-		if config.SiteID == "" {
-			config.SiteID = "default-site"
-		}
-	}
-
-	return config
 }
 
-// 获取字符串参数
+func (a *App) handleDemoPage(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(demoHTML))
+}
+
+func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := a.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	client := newClient(conn, a.hub, siteIDFromOrigin(r.Header.Get("Origin")))
+	go client.writePump()
+	client.readPump()
+}
+
+func siteIDFromOrigin(origin string) string {
+	parsed, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Hostname())
+}
+
+func isWebSocketRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
 func getParam(params url.Values, key, defaultValue string) string {
-	if value := params.Get(key); value != "" {
+	if value := strings.TrimSpace(params.Get(key)); value != "" {
 		return value
 	}
 	return defaultValue
 }
 
-// 获取整数参数
-func getIntParam(params url.Values, key string, defaultValue int) int {
-	if value := params.Get(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
-		}
+func getClampedIntParam(params url.Values, key string, defaultValue, minimum, maximum int) int {
+	value := strings.TrimSpace(params.Get(key))
+	if value == "" {
+		return defaultValue
 	}
-	return defaultValue
-}
-
-// 获取布尔参数
-func getBoolParam(params url.Values, key string, defaultValue bool) bool {
-	if value := params.Get(key); value != "" {
-		if boolValue, err := strconv.ParseBool(value); err == nil {
-			return boolValue
-		}
-	}
-	return defaultValue
-}
-
-// 处理演示页面请求
-func handleDemoPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(demoHTML))
-}
-
-// 处理WebSocket连接
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	intValue, err := strconv.Atoi(value)
 	if err != nil {
-		return
+		return defaultValue
 	}
-
-	clientIP := getRealIP(r)
-
-	client := &Client{
-		conn: conn,
-		hub:  hub,
-		send: make(chan Message, 16),
-		ip:   clientIP,
+	if intValue < minimum {
+		return minimum
 	}
-
-	go client.readPump()
-	go client.writePump()
+	if intValue > maximum {
+		return maximum
+	}
+	return intValue
 }
 
-// 读取客户端消息
-func (c *Client) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
-
-	c.conn.SetReadLimit(256)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	for {
-		_, msgData, err := c.conn.ReadMessage()
-		if err != nil {
-			break
-		}
-
-		var msg Message
-		if err := json.Unmarshal(msgData, &msg); err != nil {
-			continue
-		}
-
-		if msg.Type == "join" && msg.SiteID != "" {
-			siteID := strings.TrimSpace(msg.SiteID)
-
-			if c.site != nil && c.site.ID != siteID {
-				c.hub.unregister <- c
-			}
-
-			if c.site == nil || c.site.ID != siteID {
-				site := c.hub.getSite(siteID)
-				c.site = site
-				c.hub.register <- c
-			}
-		}
+func getBoolParam(params url.Values, key string, defaultValue bool) bool {
+	value := strings.TrimSpace(params.Get(key))
+	if value == "" {
+		return defaultValue
 	}
+	boolValue, err := strconv.ParseBool(value)
+	if err != nil {
+		return defaultValue
+	}
+	return boolValue
 }
 
-// 向客户端发送消息
-func (c *Client) writePump() {
-	ticker := time.NewTicker(54 * time.Second)
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
-
-	for {
-		select {
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
-			if err := c.conn.WriteJSON(message); err != nil {
-				return
-			}
-
-		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-		}
-	}
-}
-
-// 主函数
 func main() {
+	addr := flag.String("addr", "0.0.0.0:10086", "监听地址")
 	flag.Parse()
 
-	// 初始化Hub
-	hub = NewHub()
-	go hub.Run()
-
-	// 设置路由
-	http.HandleFunc("/", handleRequest)
-
-	// 创建服务器
+	app := NewApp()
 	server := &http.Server{
-		Addr:    *addr,
-		Handler: nil,
+		Addr:              *addr,
+		Handler:           http.HandlerFunc(app.handleRequest),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	// 启动服务器
 	go func() {
 		log.Printf("LiveUser v%s 启动成功，监听 %s", Version, *addr)
-
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("服务器启动失败: %v", err)
 		}
 	}()
 
-	// 等待关闭信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
 	log.Println("正在关闭服务器...")
 
-	// 通知所有客户端即将关闭
-	hub.mutex.RLock()
-	for _, site := range hub.sites {
-		site.mutex.RLock()
-		for client := range site.Connections {
-			shutdownMsg := Message{
-				Type:    "shutdown",
-				Message: "服务器重启中，请稍后重连",
-			}
-			select {
-			case client.send <- shutdownMsg:
-			default:
-			}
-			client.conn.Close()
-		}
-		site.mutex.RUnlock()
-	}
-	hub.mutex.RUnlock()
+	app.hub.sendShutdown(Message{
+		Type:    "shutdown",
+		Message: "服务器重启中，请稍后重连",
+	})
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("HTTP 服务关闭失败: %v", err)
+	}
 	log.Println("服务器已关闭")
 }
