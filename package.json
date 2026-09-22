@@ -8,9 +8,9 @@
     "worker:check": "npm run worker:types && tsc --noEmit",
     "worker:test": "vitest run",
     "worker:dev": "wrangler dev --local",
+    "worker:deploy": "wrangler deploy && wrangler d1 migrations apply liveuser --remote",
     "worker:deploy:check": "wrangler deploy --dry-run",
-    "worker:migrate:local": "wrangler d1 migrations apply liveuser --local",
-    "worker:migrate:remote": "wrangler d1 migrations apply liveuser --remote"
+    "worker:migrate:local": "wrangler d1 migrations apply liveuser --local"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.22.0",

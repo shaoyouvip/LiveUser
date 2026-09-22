@@ -1,6 +1,6 @@
 # LiveUser 架构
 
-更新时间：2026-09-22 16:44（Asia/Shanghai）
+更新时间：2026-09-22 18:26（Asia/Shanghai）
 
 ## 目标
 
@@ -90,7 +90,7 @@ Worker 必需配置：
 
 | 配置 | 说明 |
 | --- | --- |
-| `VISITOR_HMAC_SECRET` | 至少 32 字符的 HMAC 密钥，使用 Wrangler secret |
+| `VISITOR_HMAC_SECRET` | 至少 32 字符的 HMAC 密钥，在 Worker 的“设置 → 变量和密钥”中配置 |
 | `DB` | D1 binding，在 `wrangler.jsonc` 中配置 |
 
 Worker 接受任意合法网站 Origin，CORS 回显请求 Origin。
@@ -102,7 +102,9 @@ Worker 接受任意合法网站 Origin，CORS 回显请求 Origin。
 - 推送 `main` 只运行 CI；发布 GHCR 镜像需手动执行 `workflow_dispatch`。
 - 反向代理必须支持 WebSocket Upgrade，并将 `/v1/visit` 路由到 Worker。
 - `serverUrl` 同时决定 WebSocket 与 `/v1/visit` 的地址；跨域接入时，目标基址必须同时具备这两条路由。
-- 首次部署先从 `.dev.vars.example` 创建本地 `.dev.vars`，填写 `VISITOR_HMAC_SECRET` 后执行 `wrangler deploy --secrets-file .dev.vars`。Wrangler 会创建或绑定 Worker、D1；如把真实 `database_id` 写回本地配置，不要提交。随后执行 migrations。
+- Worker 通过 Cloudflare Workers 构建从 Git 部署：构建命令留空，部署命令使用 `npm run worker:deploy`。
+- `worker:deploy` 先执行 `wrangler deploy`，再执行 `wrangler d1 migrations apply liveuser --remote`。首次部署会自动创建并绑定 D1，不要求 Fork 用户本地执行 Wrangler。
+- `VISITOR_HMAC_SECRET` 在 Worker 的“设置 → 变量和密钥”中配置，必须使用运行时密钥，不要放到“构建变量和密钥”。
 - 不把生产域名、D1 `database_id`、密钥或服务器信息写入公开仓库。
 
 ## 验证
